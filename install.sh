@@ -1,48 +1,140 @@
 #!/usr/bin/env bash
 # Установка VPN-сервера: Xray VLESS + XHTTP за nginx с настоящим сертификатом и сайтом-заглушкой.
-# Запуск на чистом Ubuntu 24.04 от root одной командой:
-#   curl -fsSL https://raw.githubusercontent.com/zleematana/vpn-setup/main/install.sh | bash -s -- vpn.example.com phone laptop
-# Первый аргумент — домен, остальные — имена ключей (по умолчанию: phone pc). В конце печатаются ссылки и QR-коды.
+# Запуск на чистом Ubuntu 24.04 от root. Без параметров скрипт сам задаст вопросы:
+#   curl -fsSL https://raw.githubusercontent.com/zleematana/vpn-setup/main/install.sh | bash
+# Или всё сразу, без вопросов:
+#   ... | bash -s -- vpn.example.com phone laptop                    (вход по паролю не трогается)
+#   ... | bash -s -- vpn.example.com phone --ssh-key "ssh-ed25519 AAAA..."   (добавить ключ и выключить пароль)
+#   ... | bash -s -- vpn.example.com --no-password                   (выключить пароль, ключ уже на сервере)
 # До запуска A-запись домена должна смотреть на этот сервер (Cloudflare: DNS only, без прокси).
 # Повторный запуск безопасен: существующие ключи и секретный путь сохраняются.
 set -euo pipefail
 
-DOMAIN=${1:?"Укажи домен: bash install.sh vpn.example.com [ключ1 ключ2 ...]"}
-shift
-KEYS=("$@")
-LABEL=${LABEL:-${DOMAIN%%.*}}
 RAW=${VPN_SETUP_RAW:-https://raw.githubusercontent.com/zleematana/vpn-setup/main}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)
 XDIR=/usr/local/etc/xray
 SOCK=/dev/shm/xray-xhttp.sock
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 
-[ "$(id -u)" = 0 ] || { echo "Запускай от root." >&2; exit 1; }
-for k in "${KEYS[@]}"; do
-    [[ "$k" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || { echo "Имя ключа «$k»: латиница в нижнем регистре, цифры, - и _, до 32 символов." >&2; exit 1; }
+die() { echo; echo "ОШИБКА: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "Запускай от root (войди на сервер как root)."
+grep -q 'VERSION_ID="2[2-9]' /etc/os-release 2>/dev/null && grep -q '^ID=ubuntu' /etc/os-release \
+    || echo "Внимание: скрипт проверен на Ubuntu 24.04, на этой системе может не заработать."
+
+DOMAIN="" KEYS=() SSH_KEY="" NO_PASSWORD=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ssh-key) SSH_KEY=${2:-}; shift 2 || die "После --ssh-key нужен ключ в кавычках." ;;
+        --no-password) NO_PASSWORD=1; shift ;;
+        -*) die "Неизвестный параметр $1" ;;
+        *) if [ -z "$DOMAIN" ]; then DOMAIN=$1; else KEYS+=("$1"); fi; shift ;;
+    esac
 done
 
-MYIP=$(curl -4 -s https://api.ipify.org)
-DNSIP=$(getent ahostsv4 "$DOMAIN" | awk 'NR==1{print $1}')
-[ "$MYIP" = "$DNSIP" ] || { echo "$DOMAIN указывает на ${DNSIP:-ничего}, а сервер — $MYIP. Сначала поправь A-запись." >&2; exit 1; }
+# Вопросы задаются, только если домен не передан в команде. Читаем с терминала:
+# сам скрипт приходит через curl | bash, и обычный ввод занят им.
+ask() { local a=""; read -r -p "$1" a </dev/tty || true; echo "$a"; }
+OLD_DOMAIN=$( [ -f "$XDIR/client.env" ] && (. "$XDIR/client.env"; echo "$DOMAIN") || true )
+if [ -z "$DOMAIN" ]; then
+    [ -r /dev/tty ] || die "Укажи домен: ... | bash -s -- vpn.example.com"
+    echo
+    echo "Установка VPN. Нужно ответить на 3 вопроса."
+    echo
+    while [ -z "$DOMAIN" ]; do
+        if [ -n "$OLD_DOMAIN" ]; then
+            DOMAIN=$(ask "1. Домен сервера [Enter — оставить $OLD_DOMAIN]: "); DOMAIN=${DOMAIN:-$OLD_DOMAIN}
+        else
+            DOMAIN=$(ask "1. Домен или поддомен, который смотрит на этот сервер (например vpn.example.com): ")
+        fi
+    done
+    echo
+    echo "2. Ключи: по одному на каждое устройство или человека. Имена латиницей, через пробел."
+    if [ -n "$OLD_DOMAIN" ]; then
+        read -r -a KEYS <<<"$(ask "   Какие ключи добавить [Enter — не добавлять новых]: ")"
+    else
+        read -r -a KEYS <<<"$(ask "   Какие ключи создать [Enter — phone pc]: ")"
+    fi
+    echo
+    echo "3. Вход на сервер. Сейчас ты заходишь по паролю — так и останется, если ответить «нет»."
+    echo "   «да» — вход только по SSH-ключу: надёжнее, но без ключа на сервер будет не попасть."
+    if [[ "$(ask "   Выключить вход по паролю? [нет/да]: ")" =~ ^(да|д|yes|y)$ ]]; then
+        if [ -s /root/.ssh/authorized_keys ]; then
+            echo "   На сервере уже есть SSH-ключ ($(grep -c . /root/.ssh/authorized_keys) шт.), пароль будет выключен."
+            NO_PASSWORD=1
+        else
+            SSH_KEY=$(ask "   Вставь свой публичный ключ (строка, начинается с ssh-ed25519 или ssh-rsa): ")
+            [ -n "$SSH_KEY" ] || echo "   Ключ не вставлен — вход по паролю остаётся."
+        fi
+    fi
+    echo
+fi
 
-echo "== Пакеты"
+DOMAIN=$(echo "$DOMAIN" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##')
+[[ "$DOMAIN" =~ ^([a-z0-9-]+\.)+[a-z]{2,}$ ]] || die "«$DOMAIN» не похож на домен. Нужно что-то вроде vpn.example.com, без http:// и слэшей."
+LABEL=${LABEL:-${DOMAIN%%.*}}
+for k in "${KEYS[@]}"; do
+    [[ "$k" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || die "Имя ключа «$k»: только латиница в нижнем регистре, цифры, - и _, до 32 символов."
+done
+if [ -n "$SSH_KEY" ]; then
+    [[ "$SSH_KEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+)\ [A-Za-z0-9+/=]+ ]] \
+        || die "Это не похоже на публичный SSH-ключ. Он начинается с ssh-ed25519 или ssh-rsa и занимает одну строку."
+fi
+if [ "$NO_PASSWORD" = 1 ] && [ -z "$SSH_KEY" ] && [ ! -s /root/.ssh/authorized_keys ]; then
+    die "--no-password: на сервере нет ни одного SSH-ключа, после этого на него нельзя было бы зайти. Передай ключ через --ssh-key."
+fi
+
+echo "== Проверяю домен"
+MYIP=$(curl -4 -fsS -m 10 https://api.ipify.org || curl -4 -fsS -m 10 https://ifconfig.me)
+# Спрашиваем публичный DNS напрямую, чтобы не ждать, пока обновится кэш самого сервера.
+resolve() {
+    local ip
+    ip=$(curl -fsS -m 5 -H 'accept: application/dns-json' "https://1.1.1.1/dns-query?name=$1&type=A" 2>/dev/null \
+        | grep -oE '"data":"[0-9.]+"' | head -1 | cut -d'"' -f4 || true)
+    [ -n "$ip" ] || ip=$(getent ahostsv4 "$1" | awk 'NR==1{print $1}')
+    echo "$ip"
+}
+DNSIP=$(resolve "$DOMAIN")
+if [ "$DNSIP" != "$MYIP" ]; then
+    if [ -n "$DNSIP" ]; then echo "   $DOMAIN сейчас указывает на $DNSIP, а у этого сервера адрес $MYIP."; else echo "   $DOMAIN пока никуда не указывает, а у этого сервера адрес $MYIP."; fi
+    echo "   Нужна A-запись: $DOMAIN → $MYIP. В Cloudflare — серое облако (DNS only), не оранжевое."
+    echo "   Жду, пока запись заработает (до 15 минут). Прервать — Ctrl+C."
+    for _ in $(seq 1 45); do
+        sleep 20
+        DNSIP=$(resolve "$DOMAIN")
+        [ "$DNSIP" = "$MYIP" ] && break
+        printf '.'
+    done
+    echo
+    [ "$DNSIP" = "$MYIP" ] || die "$DOMAIN так и не указывает на $MYIP (сейчас: ${DNSIP:-никуда}). Проверь A-запись и запусти команду ещё раз. Если там адрес Cloudflare — выключи оранжевое облако."
+fi
+echo "   $DOMAIN → $MYIP, всё верно."
+
+echo "== Пакеты (пара минут)"
 apt-get update -qq
 apt-get -y -qq -o Dpkg::Options::=--force-confold upgrade >/dev/null
-apt-get install -y -qq nginx certbot ufw unzip curl jq qrencode openssl >/dev/null
+apt-get install -y -qq nginx certbot ufw unzip curl jq qrencode openssl fail2ban >/dev/null
+# fail2ban на 10 минут блокирует адрес после 5 неверных паролей — защита от подбора.
+systemctl enable -q --now fail2ban
 
-echo "== SSH только по ключу"
-if [ -s /root/.ssh/authorized_keys ]; then
-    cat > /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
+echo "== Вход на сервер"
+if [ -n "$SSH_KEY" ]; then
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh
+    touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
+    grep -qxF "$SSH_KEY" /root/.ssh/authorized_keys || echo "$SSH_KEY" >> /root/.ssh/authorized_keys
+    NO_PASSWORD=1
+fi
+if [ "$NO_PASSWORD" = 1 ]; then
+    rm -f /etc/ssh/sshd_config.d/00-hardening.conf   # имя из ранних версий скрипта
+    cat > /etc/ssh/sshd_config.d/00-vpn-setup.conf <<EOF
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 PubkeyAuthentication yes
 EOF
-    rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf
     sshd -t && systemctl reload ssh
+    echo "   Вход только по SSH-ключу, пароль выключен. Вернуть: vpn ssh password on"
 else
-    echo "   В /root/.ssh/authorized_keys пусто — вход по паролю оставлен, чтобы не потерять доступ."
+    echo "   Вход не менялся. Защита от подбора пароля (fail2ban) включена."
 fi
 
 echo "== BBR и файрвол (22, 80, 443)"
@@ -245,5 +337,19 @@ for k in "${SHOW[@]}"; do
     echo; echo "===== Ключ «$k» ====="
     vpn link "$k"
 done
-echo
-echo "Готово. Управление: vpn list | vpn add <имя> | vpn del <имя> | vpn link <имя> | vpn check"
+cat <<EOF
+
+========================================================================
+Готово. VPN работает на $DOMAIN.
+
+Что дальше:
+  1. Поставь на телефон или компьютер приложение Happ (App Store, Google Play)
+     или v2rayN (Windows).
+  2. Скопируй ссылку vless://... нужного ключа выше и в приложении нажми
+     «+» → «Импорт из буфера». Или отсканируй QR-код камерой приложения.
+  3. Подключись и открой любой сайт.
+
+Один ключ — одно устройство или один человек. Ключи и ссылки хранятся
+на сервере, показать снова: vpn link <имя>. Все команды: vpn
+========================================================================
+EOF

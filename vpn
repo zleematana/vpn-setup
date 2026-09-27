@@ -147,6 +147,88 @@ cmd_check() {
 
 cmd_restart() { systemctl restart xray nginx; echo "xray и nginx перезапущены."; }
 
+# Вход на сервер по SSH: пароль и ключи. Настройка пишется в один файл, первый по алфавиту
+# в sshd_config.d, поэтому перекрывает настройки хостера.
+SSHD_CONF=/etc/ssh/sshd_config.d/00-vpn-setup.conf
+AUTH_KEYS=/root/.ssh/authorized_keys
+
+ssh_password_state() { sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2}'; }
+ssh_keys_count() { local n=0; [ -f "$AUTH_KEYS" ] && n=$(grep -cE '^(ssh-|ecdsa-)' "$AUTH_KEYS" || true); echo "${n:-0}"; }
+
+ssh_apply() {
+    rm -f /etc/ssh/sshd_config.d/00-hardening.conf   # имя из ранних версий скрипта
+    printf '%s\n' "$@" > "$SSHD_CONF"
+    sshd -t || { rm -f "$SSHD_CONF"; die "sshd не принял настройку, ничего не изменено."; }
+    systemctl reload ssh
+}
+
+cmd_ssh() {
+    case "${1:-}" in
+        ""|status)
+            if [ "$(ssh_password_state)" = yes ]; then echo "Вход по паролю: включён"; else echo "Вход по паролю: выключен"; fi
+            echo "SSH-ключей на сервере: $(ssh_keys_count)"
+            echo "Защита от подбора пароля (fail2ban): $(systemctl is-active fail2ban 2>/dev/null || echo нет)"
+            echo
+            echo "  vpn ssh keys                 список ключей"
+            echo "  vpn ssh key add \"ssh-ed25519 AAAA...\"   добавить ключ"
+            echo "  vpn ssh key del <номер>      удалить ключ"
+            echo "  vpn ssh password off         вход только по ключу"
+            echo "  vpn ssh password on          снова пускать по паролю"
+            ;;
+        keys)
+            [ "$(ssh_keys_count)" -gt 0 ] || { echo "Ключей нет."; return; }
+            local i=0 type body comment
+            while read -r type body comment; do
+                i=$((i + 1))
+                [[ "$type" =~ ^(ssh-|ecdsa-) ]] || continue
+                echo "$i. $type …${body: -8} ${comment:-(без подписи)}"
+            done < "$AUTH_KEYS"
+            ;;
+        key)
+            case "${2:-}" in
+                add)
+                    local k="${3:-}"
+                    [[ "$k" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+)\ [A-Za-z0-9+/=]+ ]] \
+                        || die "Нужен публичный ключ в кавычках: vpn ssh key add \"ssh-ed25519 AAAA... имя\""
+                    mkdir -p /root/.ssh && chmod 700 /root/.ssh
+                    touch "$AUTH_KEYS" && chmod 600 "$AUTH_KEYS"
+                    grep -qxF "$k" "$AUTH_KEYS" && { echo "Этот ключ уже есть."; return; }
+                    echo "$k" >> "$AUTH_KEYS"
+                    echo "Ключ добавлен. Теперь можно входить с ним без пароля."
+                    ;;
+                del)
+                    local n="${3:-}"
+                    [[ "$n" =~ ^[0-9]+$ ]] || die "Укажи номер из списка: vpn ssh keys"
+                    sed -n "${n}p" "$AUTH_KEYS" | grep -qE '^(ssh-|ecdsa-)' || die "Ключа с номером $n нет. Список: vpn ssh keys"
+                    if [ "$(ssh_password_state)" != yes ] && [ "$(ssh_keys_count)" -le 1 ]; then
+                        die "Это последний ключ, а вход по паролю выключен — после удаления на сервер будет не попасть. Сначала: vpn ssh password on"
+                    fi
+                    sed -i "${n}d" "$AUTH_KEYS"
+                    echo "Ключ $n удалён."
+                    ;;
+                *) die "vpn ssh key add \"<ключ>\"  или  vpn ssh key del <номер>" ;;
+            esac
+            ;;
+        password)
+            case "${2:-}" in
+                off)
+                    [ "$(ssh_keys_count)" -gt 0 ] || die "На сервере нет ни одного SSH-ключа — без пароля на него будет не попасть. Сначала: vpn ssh key add \"<ключ>\""
+                    ssh_apply "PasswordAuthentication no" "KbdInteractiveAuthentication no" "PermitRootLogin prohibit-password" "PubkeyAuthentication yes"
+                    echo "Вход по паролю выключен, теперь только по ключу."
+                    echo "Не закрывай это окно, пока не проверишь в новом, что входишь по ключу."
+                    echo "Если не выходит — здесь же: vpn ssh password on"
+                    ;;
+                on)
+                    ssh_apply "PasswordAuthentication yes" "KbdInteractiveAuthentication no" "PermitRootLogin yes" "PubkeyAuthentication yes"
+                    echo "Вход по паролю включён (и по ключу тоже работает)."
+                    ;;
+                *) die "vpn ssh password off  или  vpn ssh password on" ;;
+            esac
+            ;;
+        *) die "Неизвестная команда. Справка: vpn ssh" ;;
+    esac
+}
+
 usage() {
     cat <<EOF
 vpn — управление VPN на $DOMAIN
@@ -157,6 +239,7 @@ vpn — управление VPN на $DOMAIN
   vpn del <имя>     отключить ключ
   vpn check         проверить сервер и туннель целиком
   vpn restart       перезапустить xray и nginx
+  vpn ssh           вход на сервер: пароль и SSH-ключи
 EOF
 }
 
@@ -167,5 +250,6 @@ case "${1:-}" in
     list|ls|stats) cmd_list ;;
     check)   cmd_check ;;
     restart) cmd_restart ;;
+    ssh)     shift; cmd_ssh "$@" ;;
     *)       usage ;;
 esac
