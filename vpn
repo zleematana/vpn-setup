@@ -50,6 +50,19 @@ show_link() {
 
 human() { numfmt --to=iec --suffix=B "${1:-0}"; }
 
+# Есть ли ключ в работающем Xray (а не только в файле конфига). После перезапуска API поднимается не сразу.
+live_has() {
+    local i
+    for i in 1 2 3 4 5; do
+        if "$XRAY" api inbounduser -s "$API" -tag="$TAG" 2>/dev/null | jq -e --arg n "$1" 'any(.users[]?; .email==$n)' >/dev/null 2>&1; then
+            return 0
+        fi
+        systemctl is-active -q xray && "$XRAY" api inbounduser -s "$API" -tag="$TAG" >/dev/null 2>&1 && return 1
+        sleep 1
+    done
+    return 1
+}
+
 cmd_add() {
     check_name "${1:-}" add
     [ -z "$(uuid_of "$1")" ] || die "Ключ «$1» уже есть. Показать: vpn link $1"
@@ -60,11 +73,15 @@ cmd_add() {
         '(.inbounds[] | select(.tag==$t) | .settings.clients) += [{"id":$id,"email":$n}]' "$CFG" > "$tmp"
     save_cfg "$tmp"
     # Добавляем пользователя на лету, чтобы не рвать соединения и не сбрасывать статистику.
+    # API нужно полное описание входа (с listen), иначе он молча добавляет 0 пользователей,
+    # поэтому берём вход из конфига и после вызова сверяемся с живым Xray.
     new=$(mktemp --suffix=.json)
-    jq -n --arg t "$TAG" --arg n "$1" --arg id "$id" \
-        '{inbounds:[{tag:$t,protocol:"vless",settings:{clients:[{id:$id,email:$n}],decryption:"none"}}]}' > "$new"
-    "$XRAY" api adu -s "$API" "$new" >/dev/null 2>&1 || systemctl restart xray
+    jq --arg t "$TAG" --arg n "$1" --arg id "$id" \
+        '{inbounds:[.inbounds[] | select(.tag==$t) | .settings.clients=[{id:$id,email:$n}]]}' "$CFG" > "$new"
+    "$XRAY" api adu -s "$API" "$new" >/dev/null 2>&1 || true
     rm -f "$new"
+    live_has "$1" || systemctl restart xray
+    live_has "$1" || die "Ключ записан в конфиг, но Xray его не подхватил. Смотри: journalctl -u xray -n 50"
     echo "Ключ «$1» добавлен."
     show_link "$1"
 }
@@ -76,7 +93,9 @@ cmd_del() {
     jq --arg t "$TAG" --arg n "$1" \
         '(.inbounds[] | select(.tag==$t) | .settings.clients) |= map(select(.email!=$n))' "$CFG" > "$tmp"
     save_cfg "$tmp"
-    "$XRAY" api rmu -s "$API" -tag="$TAG" "$1" >/dev/null 2>&1 || systemctl restart xray
+    "$XRAY" api rmu -s "$API" -tag="$TAG" "$1" >/dev/null 2>&1 || true
+    ! live_has "$1" || systemctl restart xray
+    ! live_has "$1" || die "Ключ удалён из конфига, но Xray его ещё пускает. Выполни: vpn restart"
     echo "Ключ «$1» отключён. Его ссылка больше не работает."
 }
 
@@ -117,6 +136,14 @@ cmd_check() {
     end=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" | cut -d= -f2)
     days=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
     if [ "$days" -ge 14 ]; then echo "✓ сертификат $DOMAIN ещё $days дн."; else echo "✗ сертификат $DOMAIN истекает через $days дн."; ok=0; fi
+
+    local missing="" n
+    while read -r n; do
+        [ -n "$n" ] || continue
+        live_has "$n" || missing="$missing $n"
+    done < <(clients)
+    if [ -z "$missing" ]; then echo "✓ все ключи ($(clients | grep -c .)) приняты Xray"
+    else echo "✗ Xray не пускает ключи:$missing — исправит vpn restart"; ok=0; fi
 
     local check_id; check_id=$(uuid_of "$CHECK_USER")
     if [ -z "$check_id" ]; then
