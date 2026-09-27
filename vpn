@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# Управление VPN-сервером (Xray VLESS + XHTTP за nginx). Запускается от root на сервере.
+# Ставится в /usr/local/bin/vpn скриптом install.sh.
+set -euo pipefail
+export LC_ALL=C.UTF-8
+CHECK_USER=_check   # служебный ключ для vpn check, в списке не показывается
+
+XRAY=/usr/local/bin/xray
+CFG=/usr/local/etc/xray/config.json
+ENV=/usr/local/etc/xray/client.env
+API=127.0.0.1:10085
+TAG=xhttp-in
+
+die() { echo "$*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "Запускай от root."
+[ -f "$ENV" ] || die "Нет $ENV — сервер не настроен install.sh."
+# shellcheck disable=SC1090
+. "$ENV"   # DOMAIN, XPATH, LABEL
+LABEL=${LABEL:-${DOMAIN%%.*}}
+
+clients() { jq -r --arg t "$TAG" '.inbounds[] | select(.tag==$t) | .settings.clients[].email | select(startswith("_") | not)' "$CFG"; }
+uuid_of() { jq -r --arg t "$TAG" --arg n "$1" '.inbounds[] | select(.tag==$t) | .settings.clients[] | select(.email==$n) | .id' "$CFG"; }
+
+check_name() {
+    [ -n "${1:-}" ] || die "Укажи имя, например: vpn $2 petya"
+    [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || die "Имя: латиница в нижнем регистре, цифры, - и _ (не первым), до 32 символов."
+}
+
+# Проверяет новый конфиг и кладёт его на место (с резервной копией config.json.bak).
+save_cfg() {
+    "$XRAY" run -test -format json -config "$1" >/dev/null 2>&1 || { rm -f "$1"; die "Новый конфиг не прошёл проверку xray, ничего не изменено."; }
+    cp -p "$CFG" "$CFG.bak"
+    install -m 644 "$1" "$CFG"
+    rm -f "$1"
+}
+
+link_of() {
+    local u; u=$(uuid_of "$1")
+    [ -n "$u" ] || die "Ключа «$1» нет. Список: vpn list"
+    local p; p=$(printf %s "$XPATH" | sed 's#/#%2F#g')
+    echo "vless://$u@$DOMAIN:443?encryption=none&security=tls&sni=$DOMAIN&alpn=h2&fp=chrome&type=xhttp&host=$DOMAIN&path=$p&mode=auto#$LABEL-$1"
+}
+
+show_link() {
+    local l; l=$(link_of "$1")
+    echo; echo "$l"; echo
+    qrencode -t ansiutf8 -m 2 "$l"
+    echo "Клиент: Happ, v2RayTun, v2rayN (Xray-core). Amnezia VPN и sing-box-клиенты не подходят."
+}
+
+human() { numfmt --to=iec --suffix=B "${1:-0}"; }
+
+cmd_add() {
+    check_name "${1:-}" add
+    [ -z "$(uuid_of "$1")" ] || die "Ключ «$1» уже есть. Показать: vpn link $1"
+    local id tmp new
+    id=$("$XRAY" uuid)
+    tmp=$(mktemp)
+    jq --arg t "$TAG" --arg n "$1" --arg id "$id" \
+        '(.inbounds[] | select(.tag==$t) | .settings.clients) += [{"id":$id,"email":$n}]' "$CFG" > "$tmp"
+    save_cfg "$tmp"
+    # Добавляем пользователя на лету, чтобы не рвать соединения и не сбрасывать статистику.
+    new=$(mktemp --suffix=.json)
+    jq -n --arg t "$TAG" --arg n "$1" --arg id "$id" \
+        '{inbounds:[{tag:$t,protocol:"vless",settings:{clients:[{id:$id,email:$n}],decryption:"none"}}]}' > "$new"
+    "$XRAY" api adu -s "$API" "$new" >/dev/null 2>&1 || systemctl restart xray
+    rm -f "$new"
+    echo "Ключ «$1» добавлен."
+    show_link "$1"
+}
+
+cmd_del() {
+    check_name "${1:-}" del
+    [ -n "$(uuid_of "$1")" ] || die "Ключа «$1» нет. Список: vpn list"
+    local tmp; tmp=$(mktemp)
+    jq --arg t "$TAG" --arg n "$1" \
+        '(.inbounds[] | select(.tag==$t) | .settings.clients) |= map(select(.email!=$n))' "$CFG" > "$tmp"
+    save_cfg "$tmp"
+    "$XRAY" api rmu -s "$API" -tag="$TAG" "$1" >/dev/null 2>&1 || systemctl restart xray
+    echo "Ключ «$1» отключён. Его ссылка больше не работает."
+}
+
+cmd_link() {
+    [ -n "${1:-}" ] || die "Укажи имя: vpn link <имя>. Список: vpn list"
+    show_link "$1"
+}
+
+# printf считает ширину в байтах, а не в буквах, поэтому кириллицу дополняем вручную.
+pad()  { local s=$1 w=$2; printf '%s%*s' "$s" $(( w > ${#s} ? w - ${#s} : 0 )) ''; }
+lpad() { local s=$1 w=$2; printf '%*s%s' $(( w > ${#s} ? w - ${#s} : 0 )) '' "$s"; }
+row()  { echo "$(pad "$1" 20) $(pad "$2" 8) $(lpad "$3" 9) $(lpad "$4" 9)"; }
+
+# Трафик считается с последнего запуска xray (перезагрузка сервера или vpn restart обнуляют счётчики).
+cmd_list() {
+    local stats online
+    stats=$("$XRAY" api statsquery -s "$API" -pattern 'user>>>' 2>/dev/null || echo '{}')
+    online=$("$XRAY" api statsgetallonlineusers -s "$API" 2>/dev/null || echo '{}')
+    row "КЛЮЧ" "СЕЙЧАС" "СКАЧАНО" "ОТДАНО"
+    local n down up on
+    while read -r n; do
+        [ -n "$n" ] || continue
+        down=$(jq -r --arg k "user>>>$n>>>traffic>>>downlink" '[.stat[]? | select(.name==$k) | .value | tonumber] | add // 0' <<<"$stats")
+        up=$(jq -r --arg k "user>>>$n>>>traffic>>>uplink" '[.stat[]? | select(.name==$k) | .value | tonumber] | add // 0' <<<"$stats")
+        on=$(grep -q "user>>>$n>>>online" <<<"$online" && echo "онлайн" || echo "-")
+        row "$n" "$on" "$(human "$down")" "$(human "$up")"
+    done < <(clients)
+    echo "Счётчики — с запуска xray: $(systemctl show xray -p ActiveEnterTimestamp --value)"
+}
+
+# Настоящая проверка: временный клиент на самом сервере идёт через $DOMAIN:443 снаружи.
+cmd_check() {
+    local ok=1 s
+    for s in xray nginx; do
+        if systemctl is-active -q "$s"; then echo "✓ $s работает"; else echo "✗ $s не работает"; ok=0; fi
+    done
+    local end days
+    end=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" | cut -d= -f2)
+    days=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
+    if [ "$days" -ge 14 ]; then echo "✓ сертификат $DOMAIN ещё $days дн."; else echo "✗ сертификат $DOMAIN истекает через $days дн."; ok=0; fi
+
+    local check_id; check_id=$(uuid_of "$CHECK_USER")
+    if [ -z "$check_id" ]; then
+        echo "✗ нет служебного ключа $CHECK_USER, туннель не проверить — перезапусти install.sh"; ok=0
+    else
+        local tmp port=10899 pid ip speed
+        tmp=$(mktemp --suffix=.json)
+        jq -n --arg d "$DOMAIN" --arg id "$check_id" --arg p "$XPATH" --argjson port $port '{
+            log:{loglevel:"none"},
+            inbounds:[{listen:"127.0.0.1",port:$port,protocol:"socks"}],
+            outbounds:[{protocol:"vless",settings:{vnext:[{address:$d,port:443,users:[{id:$id,encryption:"none"}]}]},
+              streamSettings:{network:"xhttp",security:"tls",tlsSettings:{serverName:$d,alpn:["h2"],fingerprint:"chrome"},
+                xhttpSettings:{path:$p,mode:"auto"}}}]}' > "$tmp"
+        "$XRAY" run -config "$tmp" >/dev/null 2>&1 & pid=$!
+        sleep 2
+        ip=$(curl -s -m 15 --socks5-hostname 127.0.0.1:$port https://api.ipify.org || true)
+        speed=$(curl -s -m 20 --socks5-hostname 127.0.0.1:$port -o /dev/null -w '%{speed_download}' https://fsn1-speed.hetzner.com/100MB.bin || echo 0)
+        kill "$pid" 2>/dev/null || true; rm -f "$tmp"
+        if [ -n "$ip" ]; then
+            echo "✓ туннель через $DOMAIN работает, выход с $ip, ~$(( ${speed%.*} * 8 / 1000000 )) Мбит/с"
+        else
+            echo "✗ туннель через $DOMAIN не отвечает"; ok=0
+        fi
+    fi
+    echo "  память: $(free -m | awk '/Mem/{print $3"/"$2" МБ"}'), диск: $(df -h / | awk 'NR==2{print $3"/"$2}'), работает: $(uptime -p)"
+    [ "$ok" = 1 ] && echo "Всё в порядке." || { echo "Есть проблемы — смотри выше и journalctl -u xray -n 50."; return 1; }
+}
+
+cmd_restart() { systemctl restart xray nginx; echo "xray и nginx перезапущены."; }
+
+usage() {
+    cat <<EOF
+vpn — управление VPN на $DOMAIN
+
+  vpn list          ключи, кто онлайн, трафик с запуска xray
+  vpn add <имя>     новый ключ: ссылка и QR-код
+  vpn link <имя>    снова показать ссылку и QR-код
+  vpn del <имя>     отключить ключ
+  vpn check         проверить сервер и туннель целиком
+  vpn restart       перезапустить xray и nginx
+EOF
+}
+
+case "${1:-}" in
+    add)     cmd_add "${2:-}" ;;
+    del|rm)  cmd_del "${2:-}" ;;
+    link|qr) cmd_link "${2:-}" ;;
+    list|ls|stats) cmd_list ;;
+    check)   cmd_check ;;
+    restart) cmd_restart ;;
+    *)       usage ;;
+esac
