@@ -18,8 +18,16 @@ export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 
 die() { echo; echo "ОШИБКА: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "Запускай от root (войди на сервер как root)."
-grep -q 'VERSION_ID="2[2-9]' /etc/os-release 2>/dev/null && grep -q '^ID=ubuntu' /etc/os-release \
-    || echo "Внимание: скрипт проверен на Ubuntu 24.04, на этой системе может не заработать."
+# Нужна система с apt: Ubuntu (проверено на 24.04) или Debian. На CentOS, AlmaLinux, Rocky и т. п. не пойдёт.
+OS_ID=$(. /etc/os-release 2>/dev/null; echo "${ID:-}")
+OS_NAME=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-неизвестная система}")
+if ! command -v apt-get >/dev/null 2>&1 || { [ "$OS_ID" != ubuntu ] && [ "$OS_ID" != debian ]; }; then
+    die "На сервере стоит $OS_NAME, а скрипт работает только на Ubuntu 24.04.
+Переустанови систему в личном кабинете хостера (обычно кнопка «Переустановить ОС»
+или «Reinstall»), выбери Ubuntu 24.04 и запусти команду снова.
+Внимание: переустановка стирает всё, что есть на сервере, и может сменить пароль root."
+fi
+[ "$OS_ID" = ubuntu ] || echo "Внимание: скрипт проверен на Ubuntu 24.04, на $OS_NAME может не заработать."
 
 DOMAIN="" KEYS=() SSH_KEY="" NO_PASSWORD=0
 while [ $# -gt 0 ]; do
@@ -57,7 +65,7 @@ if [ -z "$DOMAIN" ]; then
     echo
     echo "3. Вход на сервер. Сейчас ты заходишь по паролю — так и останется, если ответить «нет»."
     echo "   «да» — вход только по SSH-ключу: надёжнее, но без ключа на сервер будет не попасть."
-    if [[ "$(ask "   Выключить вход по паролю? [нет/да]: ")" =~ ^(да|д|yes|y)$ ]]; then
+    if [[ "$(ask "   Выключить вход по паролю? [нет/да]: ")" =~ ^(да|Да|ДА|д|Д|yes|Yes|YES|y|Y)$ ]]; then
         if [ -s /root/.ssh/authorized_keys ]; then
             echo "   На сервере уже есть SSH-ключ ($(grep -c . /root/.ssh/authorized_keys) шт.), пароль будет выключен."
             NO_PASSWORD=1
