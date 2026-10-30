@@ -244,11 +244,12 @@ jq -n --arg sock "$SOCK,0666" --arg path "$XPATH" --argjson clients "$CLIENTS" '
       { type: "field", protocol: ["bittorrent"], outboundTag: "block" }
     ]
   }
-}' > "$XDIR/config.json.new"
-/usr/local/bin/xray run -test -format json -config "$XDIR/config.json.new" >/dev/null
+}' > "$XDIR/config.new.json"
+# Имя на .json: Xray с версии 26.10 не читает файлы с другим расширением.
+/usr/local/bin/xray run -test -format json -config "$XDIR/config.new.json" >/dev/null
 [ -f "$XDIR/config.json" ] && cp -p "$XDIR/config.json" "$XDIR/config.json.bak"
-install -m 644 "$XDIR/config.json.new" "$XDIR/config.json"
-rm -f "$XDIR/config.json.new"
+install -m 644 "$XDIR/config.new.json" "$XDIR/config.json"
+rm -f "$XDIR/config.new.json"
 
 cat > /etc/systemd/system/xray.service <<EOF
 [Unit]

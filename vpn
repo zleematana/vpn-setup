@@ -127,7 +127,7 @@ cmd_add() {
     [ -z "$(uuid_of "$1")" ] || die "Ключ «$1» уже есть. Показать: vpn link $1"
     local id tmp new
     id=$("$XRAY" uuid)
-    tmp=$(mktemp)
+    tmp=$(mktemp --suffix=.json)   # Xray с версии 26.10 проверяет только файлы с расширением .json
     jq --arg t "$TAG" --arg n "$1" --arg id "$id" \
         '(.inbounds[] | select(.tag==$t) | .settings.clients) += [{"id":$id,"email":$n}]' "$CFG" > "$tmp"
     save_cfg "$tmp"
@@ -148,7 +148,7 @@ cmd_add() {
 cmd_del() {
     check_name "${1:-}" del
     [ -n "$(uuid_of "$1")" ] || die "Ключа «$1» нет. Список: vpn list"
-    local tmp; tmp=$(mktemp)
+    local tmp; tmp=$(mktemp --suffix=.json)
     jq --arg t "$TAG" --arg n "$1" \
         '(.inbounds[] | select(.tag==$t) | .settings.clients) |= map(select(.email!=$n))' "$CFG" > "$tmp"
     save_cfg "$tmp"
