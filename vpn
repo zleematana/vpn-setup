@@ -34,18 +34,77 @@ save_cfg() {
     rm -f "$1"
 }
 
+# Публичный IPv4 сервера. Можно задать IP=… в client.env, если автоопределение ошибается.
+server_ip() {
+    [ -n "${IP:-}" ] && { echo "$IP"; return; }
+    IP=$(curl -4 -s -m 5 https://api.ipify.org || true)
+    [[ "$IP" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || IP=$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}')
+    echo "$IP"
+}
+
+# Как сейчас идёт путь через домен: напрямую или через прокси (оранжевое облако Cloudflare).
+domain_path() {
+    local ips; ips=$(curl -s -m 5 -H 'accept: application/dns-json' "https://1.1.1.1/dns-query?name=$DOMAIN&type=A" \
+        | jq -r '.Answer[]? | select(.type==1) | .data' 2>/dev/null || true)
+    if [ -z "$ips" ]; then echo "не резолвится"
+    elif grep -qxF "$(server_ip)" <<<"$ips"; then echo "напрямую"
+    else echo "через прокси ($(head -1 <<<"$ips"))"; fi
+}
+
+# Два пути к одному ключу: через домен и прямо на IP сервера. В обоих SNI и Host — домен,
+# поэтому сертификат подходит, а прямой путь не зависит от DNS и Cloudflare.
 link_of() {
     local u; u=$(uuid_of "$1")
     [ -n "$u" ] || die "Ключа «$1» нет. Список: vpn list"
     local p; p=$(printf %s "$XPATH" | sed 's#/#%2F#g')
-    echo "vless://$u@$DOMAIN:443?encryption=none&security=tls&sni=$DOMAIN&alpn=h2&fp=chrome&type=xhttp&host=$DOMAIN&path=$p&mode=auto#$LABEL-$1"
+    local addr=$DOMAIN name=$LABEL-$1
+    [ "${2:-}" = ip ] && { addr=$(server_ip); name=$name-ip; }
+    echo "vless://$u@$addr:443?encryption=none&security=tls&sni=$DOMAIN&alpn=h2&fp=chrome&type=xhttp&host=$DOMAIN&path=$p&mode=auto#$name"
 }
 
 show_link() {
     local l; l=$(link_of "$1")
-    echo; echo "$l"; echo
+    echo; echo "Через домен (сейчас $(domain_path)):"; echo "$l"; echo
     qrencode -t ansiutf8 -m 2 "$l"
+    l=$(link_of "$1" ip)
+    echo "Напрямую на IP $(server_ip), запасная:"; echo "$l"; echo
+    qrencode -t ansiutf8 -m 2 "$l"
+    echo "Добавь обе. Конфиг, который сам переключается между ними: vpn json $1"
     echo "Клиент: Happ, v2RayTun, v2rayN (Xray-core). Amnezia VPN и sing-box-клиенты не подходят."
+}
+
+# Исходящее соединение VLESS + XHTTP до $1 (адрес) с ключом $2 и тегом $3.
+outbound_json() {
+    jq -n --arg a "$1" --arg id "$2" --arg tag "$3" --arg d "$DOMAIN" --arg p "$XPATH" '{
+        tag:$tag, protocol:"vless",
+        settings:{vnext:[{address:$a,port:443,users:[{id:$id,encryption:"none"}]}]},
+        streamSettings:{network:"xhttp",security:"tls",tlsSettings:{serverName:$d,alpn:["h2"],fingerprint:"chrome"},
+            xhttpSettings:{host:$d,path:$p,mode:"auto"}}}'
+}
+
+# Конфиг Xray для клиента: оба пути и балансировщик, который раз в 30 с проверяет их
+# и ведёт трафик через живой и самый быстрый. Если оба мертвы — пробует прямой IP, но не мимо VPN.
+cmd_json() {
+    [ -n "${1:-}" ] || die "Укажи имя: vpn json <имя>. Список: vpn list"
+    local u; u=$(uuid_of "$1")
+    [ -n "$u" ] || die "Ключа «$1» нет. Список: vpn list"
+    jq -n --arg r "$LABEL-$1 авто" \
+        --argjson a "$(outbound_json "$DOMAIN" "$u" proxy-domain)" \
+        --argjson b "$(outbound_json "$(server_ip)" "$u" proxy-ip)" '{
+        remarks:$r,
+        log:{loglevel:"warning"},
+        inbounds:[
+            {tag:"socks",listen:"127.0.0.1",port:10808,protocol:"socks",settings:{udp:true},
+             sniffing:{enabled:true,destOverride:["http","tls","quic"],routeOnly:true}},
+            {tag:"http",listen:"127.0.0.1",port:10809,protocol:"http"}],
+        outbounds:[$a,$b,{tag:"direct",protocol:"freedom"},{tag:"block",protocol:"blackhole"}],
+        burstObservatory:{subjectSelector:["proxy-"],
+            pingConfig:{destination:"https://www.gstatic.com/generate_204",interval:"30s",timeout:"5s",sampling:2}},
+        routing:{domainStrategy:"AsIs",
+            balancers:[{tag:"auto",selector:["proxy-"],strategy:{type:"leastPing"},fallbackTag:"proxy-ip"}],
+            rules:[
+                {ip:["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","fc00::/7","fe80::/10"],outboundTag:"direct"},
+                {network:"tcp,udp",balancerTag:"auto"}]}}'
 }
 
 human() { numfmt --to=iec --suffix=B "${1:-0}"; }
@@ -126,7 +185,7 @@ cmd_list() {
     echo "Счётчики — с запуска xray: $(systemctl show xray -p ActiveEnterTimestamp --value)"
 }
 
-# Настоящая проверка: временный клиент на самом сервере идёт через $DOMAIN:443 снаружи.
+# Настоящая проверка: временный клиент на самом сервере идёт снаружи через $DOMAIN:443 и через IP:443.
 cmd_check() {
     local ok=1 s
     for s in xray nginx; do
@@ -149,24 +208,25 @@ cmd_check() {
     if [ -z "$check_id" ]; then
         echo "✗ нет служебного ключа $CHECK_USER, туннель не проверить — перезапусти install.sh"; ok=0
     else
-        local tmp port=10899 pid ip speed
-        tmp=$(mktemp --suffix=.json)
-        jq -n --arg d "$DOMAIN" --arg id "$check_id" --arg p "$XPATH" --argjson port $port '{
-            log:{loglevel:"none"},
-            inbounds:[{listen:"127.0.0.1",port:$port,protocol:"socks"}],
-            outbounds:[{protocol:"vless",settings:{vnext:[{address:$d,port:443,users:[{id:$id,encryption:"none"}]}]},
-              streamSettings:{network:"xhttp",security:"tls",tlsSettings:{serverName:$d,alpn:["h2"],fingerprint:"chrome"},
-                xhttpSettings:{path:$p,mode:"auto"}}}]}' > "$tmp"
-        "$XRAY" run -config "$tmp" >/dev/null 2>&1 & pid=$!
-        sleep 2
-        ip=$(curl -s -m 15 --socks5-hostname 127.0.0.1:$port https://api.ipify.org || true)
-        speed=$(curl -s -m 20 --socks5-hostname 127.0.0.1:$port -o /dev/null -w '%{speed_download}' https://fsn1-speed.hetzner.com/100MB.bin || echo 0)
-        kill "$pid" 2>/dev/null || true; rm -f "$tmp"
-        if [ -n "$ip" ]; then
-            echo "✓ туннель через $DOMAIN работает, выход с $ip, ~$(( ${speed%.*} * 8 / 1000000 )) Мбит/с"
-        else
-            echo "✗ туннель через $DOMAIN не отвечает"; ok=0
-        fi
+        local addr what tmp port=10899 pid ip speed
+        for addr in "$DOMAIN" "$(server_ip)"; do
+            if [ "$addr" = "$DOMAIN" ]; then what="через $DOMAIN ($(domain_path))"; else what="напрямую на $addr"; fi
+            tmp=$(mktemp --suffix=.json)
+            jq -n --argjson o "$(outbound_json "$addr" "$check_id" out)" --argjson port $port '{
+                log:{loglevel:"none"},
+                inbounds:[{listen:"127.0.0.1",port:$port,protocol:"socks"}],
+                outbounds:[$o]}' > "$tmp"
+            "$XRAY" run -config "$tmp" >/dev/null 2>&1 & pid=$!
+            sleep 2
+            ip=$(curl -s -m 15 --socks5-hostname 127.0.0.1:$port https://api.ipify.org || true)
+            speed=$(curl -s -m 20 --socks5-hostname 127.0.0.1:$port -o /dev/null -w '%{speed_download}' https://fsn1-speed.hetzner.com/100MB.bin || echo 0)
+            kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -f "$tmp"
+            if [ -n "$ip" ]; then
+                echo "✓ туннель $what работает, выход с $ip, ~$(( ${speed%.*} * 8 / 1000000 )) Мбит/с"
+            else
+                echo "✗ туннель $what не отвечает"; ok=0
+            fi
+        done
     fi
     echo "  память: $(free -m | awk '/Mem/{print $3"/"$2" МБ"}'), диск: $(df -h / | awk 'NR==2{print $3"/"$2}'), работает: $(uptime -p)"
     [ "$ok" = 1 ] && echo "Всё в порядке." || { echo "Есть проблемы — смотри выше и journalctl -u xray -n 50."; return 1; }
@@ -262,7 +322,8 @@ vpn — управление VPN на $DOMAIN
 
   vpn list          ключи, кто онлайн, трафик с запуска xray
   vpn add <имя>     новый ключ: ссылка и QR-код
-  vpn link <имя>    снова показать ссылку и QR-код
+  vpn link <имя>    снова показать ссылки и QR-коды (через домен и напрямую на IP)
+  vpn json <имя>    конфиг для Happ/v2RayTun, сам переключается между путями
   vpn del <имя>     отключить ключ
   vpn check         проверить сервер и туннель целиком
   vpn restart       перезапустить xray и nginx
@@ -274,6 +335,7 @@ case "${1:-}" in
     add)     cmd_add "${2:-}" ;;
     del|rm)  cmd_del "${2:-}" ;;
     link|qr) cmd_link "${2:-}" ;;
+    json)    cmd_json "${2:-}" ;;
     list|ls|stats) cmd_list ;;
     check)   cmd_check ;;
     restart) cmd_restart ;;
