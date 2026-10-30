@@ -101,10 +101,22 @@ resolve() {
     [ -n "$ip" ] || ip=$(getent ahostsv4 "$1" | awk 'NR==1{print $1}')
     echo "$ip"
 }
+# Домен доходит до этого сервера, даже если смотрит на прокси (оранжевое облако Cloudflare):
+# проверяем по случайному файлу, который отдаёт наш же nginx. Годится для повторного запуска.
+via_proxy() {
+    systemctl is-active -q nginx 2>/dev/null && [ -d /var/www/files ] || return 1
+    local t got; t=vpn-$(openssl rand -hex 8)
+    echo "$t" > "/var/www/files/$t.txt"
+    got=$(curl -sL -m 10 "https://$DOMAIN/$t.txt" || true)
+    rm -f "/var/www/files/$t.txt"
+    [ "$got" = "$t" ]
+}
 DNSIP=$(resolve "$DOMAIN")
-if [ "$DNSIP" != "$MYIP" ]; then
+if [ "$DNSIP" != "$MYIP" ] && [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] && via_proxy; then
+    echo "   $DOMAIN указывает на $DNSIP (прокси) и доходит до этого сервера, всё верно."
+elif [ "$DNSIP" != "$MYIP" ]; then
     if [ -n "$DNSIP" ]; then echo "   $DOMAIN сейчас указывает на $DNSIP, а у этого сервера адрес $MYIP."; else echo "   $DOMAIN пока никуда не указывает, а у этого сервера адрес $MYIP."; fi
-    echo "   Нужна A-запись: $DOMAIN → $MYIP. В Cloudflare — серое облако (DNS only), не оранжевое."
+    echo "   Нужна A-запись: $DOMAIN → $MYIP. В Cloudflare на время установки — серое облако (DNS only), не оранжевое."
     echo "   Жду, пока запись заработает (до 15 минут). Прервать — Ctrl+C."
     for _ in $(seq 1 45); do
         sleep 20
@@ -114,8 +126,10 @@ if [ "$DNSIP" != "$MYIP" ]; then
     done
     echo
     [ "$DNSIP" = "$MYIP" ] || die "$DOMAIN так и не указывает на $MYIP (сейчас: ${DNSIP:-никуда}). Проверь A-запись и запусти команду ещё раз. Если там адрес Cloudflare — выключи оранжевое облако."
+    echo "   $DOMAIN → $MYIP, всё верно."
+else
+    echo "   $DOMAIN → $MYIP, всё верно."
 fi
-echo "   $DOMAIN → $MYIP, всё верно."
 
 echo "== Пакеты (пара минут)"
 apt-get update -qq
@@ -275,6 +289,15 @@ systemctl enable -q xray
 systemctl restart xray
 
 echo "== nginx на 443"
+# Подписки: Happ и v2RayTun получают конфиг Xray с автопереключением, остальные приложения — список ссылок.
+cat > /etc/nginx/conf.d/vpn-sub.conf <<'EOF'
+map $http_user_agent $vpn_sub_ext {
+    default txt;
+    ~*(?:happ|v2raytun) json;
+}
+EOF
+mkdir -p /var/www/sub && chmod 711 /var/www/sub
+PTITLE=$(printf %s "$LABEL" | base64 -w0)
 { echo "$HTTP_BLOCK"; cat <<EOF
 
 server {
@@ -301,6 +324,15 @@ server {
         grpc_send_timeout 1h;
         grpc_set_header Connection "";
         grpc_set_header X-Real-IP \$remote_addr;
+    }
+
+    location ~ "^/s/(?<vpn_sub>[0-9a-f]{32})\$" {
+        root /var/www/sub;
+        types { application/json json; text/plain txt; }
+        try_files /\$vpn_sub.\$vpn_sub_ext =404;   # именованная группа: регулярка в map сбивает \$1
+        add_header Cache-Control "no-store" always;
+        add_header profile-title "base64:$PTITLE" always;
+        add_header profile-update-interval "6" always;
     }
 
     location / { try_files \$uri \$uri/ =404; }
@@ -334,6 +366,7 @@ if [ ${#KEYS[@]} -eq 0 ] && [ -z "$EXISTING" ]; then KEYS=(phone pc); fi
 for k in "${KEYS[@]}"; do
     grep -qx "$k" <<<"$EXISTING" || vpn add "$k" >/dev/null
 done
+vpn sub >/dev/null
 
 echo
 echo "== Проверка"
@@ -354,11 +387,12 @@ cat <<EOF
 Что дальше:
   1. Поставь на телефон или компьютер приложение Happ (App Store, Google Play)
      или v2rayN (Windows).
-  2. Скопируй ссылку vless://... нужного ключа выше и в приложении нажми
-     «+» → «Вставить из буфера». Или «+» → «Сканировать QR».
+  2. Скопируй ссылку на подписку https://... нужного ключа выше и в приложении
+     нажми «+» → «Вставить из буфера». Или «+» → «Сканировать QR».
+     Подписка сама переключается между двумя путями и обновляется сама.
   3. Подключись и открой любой сайт.
 
-Один ключ — одно устройство или один человек. Ключи и ссылки хранятся
+Один ключ — одно устройство или один человек. Ключи и подписки хранятся
 на сервере, показать снова: vpn link <имя>. Все команды: vpn
 ========================================================================
 EOF
