@@ -29,6 +29,31 @@ if ! command -v apt-get >/dev/null 2>&1 || { [ "$OS_ID" != ubuntu ] && [ "$OS_ID
 fi
 [ "$OS_ID" = ubuntu ] || echo "Внимание: скрипт проверен на Ubuntu 24.04, на $OS_NAME может не заработать."
 
+# Вопросы задаются, только если домен не передан в команде. Читаем с терминала:
+# сам скрипт приходит через curl | bash, и обычный ввод занят им.
+ask() { local a=""; read -r -p "$1" a </dev/tty || true; echo "$a"; }
+
+# Роль сервера. Выход (по умолчанию) — заграничный сервер с доменом, как раньше.
+# Вход каскада — российский сервер с Reality, его ставит entry.sh.
+ROLE=exit
+for a in "$@"; do [ "$a" = --entry ] && ROLE=entry; done
+if [ "$ROLE" = exit ] && [ -f "$XDIR/entry.env" ]; then ROLE=entry; fi
+if [ "$ROLE" = exit ] && [ $# -eq 0 ] && [ ! -f "$XDIR/client.env" ] && [ -r /dev/tty ]; then
+    echo
+    echo "Какой это сервер?"
+    echo "  1 — выход: заграничный сервер, нужен домен (обычная установка)"
+    echo "  2 — вход каскада: российский сервер, ведёт на выходы (домен не нужен)"
+    [ "$(ask "Ответ [1/2, Enter — 1]: ")" = 2 ] && ROLE=entry
+fi
+if [ "$ROLE" = entry ]; then
+    if [ -f "$HERE/entry.sh" ] && [ -f "$HERE/vpn-entry" ]; then exec bash "$HERE/entry.sh" "$@"; fi
+    E=$(mktemp -d)
+    curl -fsSL -o "$E/entry.sh" "$RAW/entry.sh"
+    curl -fsSL -o "$E/vpn-entry" "$RAW/vpn-entry"
+    bash -n "$E/entry.sh" && bash -n "$E/vpn-entry"
+    exec bash "$E/entry.sh" "$@"
+fi
+
 DOMAIN="" KEYS=() SSH_KEY="" NO_PASSWORD=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -39,9 +64,6 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Вопросы задаются, только если домен не передан в команде. Читаем с терминала:
-# сам скрипт приходит через curl | bash, и обычный ввод занят им.
-ask() { local a=""; read -r -p "$1" a </dev/tty || true; echo "$a"; }
 OLD_DOMAIN=$( [ -f "$XDIR/client.env" ] && (. "$XDIR/client.env"; echo "$DOMAIN") || true )
 if [ -z "$DOMAIN" ]; then
     [ -r /dev/tty ] || die "Укажи домен: ... | bash -s -- vpn.example.com"

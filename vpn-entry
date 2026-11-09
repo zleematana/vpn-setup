@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+# Управление входом каскада: российский сервер принимает устройства по VLESS + Reality
+# и отправляет трафик на заграничные выходы (серверы, поставленные этим же install.sh).
+# Российские сайты и список «напрямую» выходят в интернет прямо отсюда, с российского IP.
+# Ставится в /usr/local/bin/vpn скриптом entry.sh.
+set -euo pipefail
+export LC_ALL=C.UTF-8
+CHECK_USER=_check   # служебный ключ для vpn check, в списке не показывается
+
+XRAY=/usr/local/bin/xray
+XDIR=${VPN_XDIR:-/usr/local/etc/xray}
+CFG=$XDIR/config.json
+ENV=$XDIR/entry.env        # LABEL, SNI, PRIV, PUB, SID, XPATH, DEFAULT_EXIT
+KEYS=$XDIR/keys.tsv        # имя <TAB> uuid <TAB> выход
+EXITS=$XDIR/exits          # файл на выход, в нём ссылки vless:// — по одной на путь
+DIRECT=$XDIR/direct.list   # сайты, которые идут напрямую с этого сервера, мимо выходов
+API=127.0.0.1:10085
+TAG=reality-in
+
+die() { echo "$*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "Запускай от root."
+[ -f "$ENV" ] || die "Нет $ENV — вход не настроен (install.sh, роль «вход»)."
+# shellcheck disable=SC1090
+. "$ENV"
+LABEL=${LABEL:-ru} DEFAULT_EXIT=${DEFAULT_EXIT:-}
+mkdir -p "$EXITS"; touch "$KEYS" "$DIRECT"
+
+NAME_RE='^[a-z0-9][a-z0-9_-]{0,31}$'
+check_name() {
+    [ -n "${1:-}" ] || die "Укажи имя, например: vpn $2 petya"
+    [[ "$1" =~ $NAME_RE ]] || die "Имя: латиница в нижнем регистре, цифры, - и _ (не первым), до 32 символов."
+}
+
+uuid_of() { awk -F'\t' -v n="$1" '$1==n {print $2}' "$KEYS"; }
+exit_of() { awk -F'\t' -v n="$1" '$1==n {print $3}' "$KEYS"; }
+clients() { awk -F'\t' '$1 != "" && $1 !~ /^_/ {print $1}' "$KEYS"; }
+exits()   { find "$EXITS" -maxdepth 1 -type f -printf '%f\n' | sort; }
+has_exit() { [ -s "$EXITS/$1" ]; }
+
+set_env() {
+    if grep -q "^$1=" "$ENV"; then sed -i "s|^$1=.*|$1=$2|" "$ENV"; else echo "$1=$2" >> "$ENV"; fi
+    printf -v "$1" '%s' "$2"
+}
+
+# Публичный IPv4 сервера. Можно задать IP=… в entry.env, если автоопределение ошибается.
+server_ip() {
+    [ -n "${IP:-}" ] && { echo "$IP"; return; }
+    IP=$(curl -4 -s -m 5 https://api.ipify.org || true)
+    [[ "$IP" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || IP=$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}')
+    echo "$IP"
+}
+
+# Разбор ссылок и сборка конфига — на Python: в bash разбирать URL ненадёжно.
+py() {
+    XDIR=$XDIR SNI=${SNI:-} PRIV=${PRIV:-} SID=${SID:-} XPATH=${XPATH:-} DEFAULT_EXIT=$DEFAULT_EXIT \
+    python3 - "$@" <<'PY'
+import ipaddress, json, os, re, sys, urllib.parse as up
+
+def fail(msg):
+    print(msg, file=sys.stderr); sys.exit(1)
+
+def outbound(link, tag):
+    u = up.urlsplit(link.strip())
+    if u.scheme != "vless" or not u.username or not u.hostname:
+        fail("Это не ссылка vless://")
+    q = {k: v[0] for k, v in up.parse_qs(u.query, keep_blank_values=True).items()}
+    net, sec = q.get("type") or "tcp", q.get("security") or "none"
+    user = {"id": up.unquote(u.username), "encryption": q.get("encryption") or "none"}
+    if q.get("flow"):
+        user["flow"] = q["flow"]
+    ss = {"network": net, "security": sec}
+    sni, fp = q.get("sni") or q.get("host") or u.hostname, q.get("fp") or "chrome"
+    if sec == "tls":
+        ss["tlsSettings"] = {"serverName": sni, "fingerprint": fp}
+        if q.get("alpn"):
+            ss["tlsSettings"]["alpn"] = q["alpn"].split(",")
+    elif sec == "reality":
+        if not q.get("pbk"):
+            fail("В ссылке Reality нет pbk (публичного ключа).")
+        ss["realitySettings"] = {"serverName": sni, "fingerprint": fp, "publicKey": q["pbk"],
+                                 "shortId": q.get("sid", ""), "spiderX": q.get("spx", "")}
+    elif sec != "none":
+        fail(f"Неизвестный security={sec}")
+    path = q.get("path") or "/"
+    if net == "xhttp":
+        ss["xhttpSettings"] = {"path": path, "mode": q.get("mode") or "auto"}
+        if q.get("host"):
+            ss["xhttpSettings"]["host"] = q["host"]
+    elif net == "ws":
+        ss["wsSettings"] = {"path": path}
+        if q.get("host"):
+            ss["wsSettings"]["host"] = q["host"]
+    elif net == "grpc":
+        ss["grpcSettings"] = {"serviceName": q.get("serviceName", "")}
+    elif net not in ("tcp", "raw"):
+        fail(f"Транспорт type={net} не поддерживается")
+    return {"tag": tag, "protocol": "vless",
+            "settings": {"vnext": [{"address": u.hostname, "port": u.port or 443, "users": [user]}]},
+            "streamSettings": ss}
+
+def direct_rules(path):
+    dom, ips = [], []
+    for raw in open(path, encoding="utf-8"):
+        s = raw.split("#")[0].strip()
+        if not s:
+            continue
+        if s.startswith("geoip:"):
+            ips.append(s); continue
+        try:
+            ipaddress.ip_network(s, strict=False); ips.append(s); continue
+        except ValueError:
+            pass
+        dom.append(s if re.match(r"^(geosite|domain|full|keyword|regexp):", s) else "domain:" + s)
+    rules = []
+    if dom:
+        rules.append({"domain": dom, "outboundTag": "direct"})
+    if ips:
+        rules.append({"ip": ips, "outboundTag": "direct"})
+    return rules
+
+def render():
+    E, xdir = os.environ, os.environ["XDIR"]
+    keys = []
+    for line in open(f"{xdir}/keys.tsv", encoding="utf-8"):
+        p = line.rstrip("\n").split("\t")
+        if len(p) >= 2 and p[0]:
+            keys.append((p[0], p[1], p[2] if len(p) > 2 and p[2] else ""))
+    exits = {}
+    for name in sorted(os.listdir(f"{xdir}/exits")):
+        links = [l.strip() for l in open(f"{xdir}/exits/{name}", encoding="utf-8") if l.strip().startswith("vless://")]
+        if links:
+            exits[name] = links
+    outs, bal = [], []
+    for name, links in exits.items():
+        tags = [f"x.{name}.{i}" for i in range(1, len(links) + 1)]
+        outs += [outbound(l, t) for l, t in zip(links, tags)]
+        bal.append({"tag": f"b.{name}", "selector": [f"x.{name}."],
+                    "strategy": {"type": "leastPing"}, "fallbackTag": tags[0]})
+    if outs:
+        bal.append({"tag": "b.auto", "selector": ["x."], "strategy": {"type": "leastPing"},
+                    "fallbackTag": outs[0]["tag"]})
+    default = E.get("DEFAULT_EXIT") if E.get("DEFAULT_EXIT") in exits else next(iter(exits), None)
+
+    rules = [{"ip": ["geoip:private"], "outboundTag": "block"},
+             {"protocol": ["bittorrent"], "outboundTag": "block"}]
+    rules += direct_rules(f"{xdir}/direct.list")
+    rules += [{"domain": ["geosite:category-ru"], "outboundTag": "direct"},
+              {"ip": ["geoip:ru"], "outboundTag": "direct"}]
+    by_exit = {}
+    for name, _, ex in keys:
+        ex = ex if ex == "auto" or ex in exits else default
+        if ex and ex != default:
+            by_exit.setdefault(ex, []).append(name)
+    for ex, users in by_exit.items():
+        rules.append({"user": users, "balancerTag": f"b.{ex}"})
+    rules.append({"network": "tcp,udp", "balancerTag": f"b.{default}"} if default
+                 else {"network": "tcp,udp", "outboundTag": "block"})
+
+    cfg = {
+        "log": {"loglevel": "warning", "access": "none"},
+        "stats": {},
+        "api": {"tag": "api", "listen": "127.0.0.1:10085", "services": ["HandlerService", "StatsService"]},
+        "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True, "statsUserOnline": True}}},
+        "inbounds": [{
+            "tag": "reality-in", "port": 443, "protocol": "vless",
+            "settings": {"clients": [{"id": u, "email": n} for n, u, _ in keys], "decryption": "none"},
+            "streamSettings": {
+                "network": "xhttp", "security": "reality",
+                "realitySettings": {"target": f"{E['SNI']}:443", "serverNames": [E["SNI"]],
+                                    "privateKey": E["PRIV"], "shortIds": [E["SID"]]},
+                "xhttpSettings": {"path": E["XPATH"], "mode": "auto"}},
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}}],
+        "outbounds": outs + [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
+        "routing": {"domainStrategy": "IPIfNonMatch", "balancers": bal, "rules": rules},
+    }
+    if outs:
+        # Раз в минуту проверяем пути к выходам: балансировщик ведёт трафик через живой и быстрый.
+        cfg["burstObservatory"] = {"subjectSelector": ["x."], "pingConfig": {
+            "destination": "https://www.gstatic.com/generate_204", "interval": "1m", "timeout": "5s", "sampling": 2}}
+    json.dump(cfg, sys.stdout, ensure_ascii=False, indent=2)
+
+cmd = sys.argv[1]
+if cmd == "outbound":
+    json.dump(outbound(sys.argv[2], sys.argv[3]), sys.stdout)
+elif cmd == "render":
+    render()
+PY
+}
+
+# Проверяет новый конфиг и кладёт его на место (с резервной копией config.json.bak).
+save_cfg() {
+    "$XRAY" run -test -format json -config "$1" >/dev/null 2>&1 || { rm -f "$1"; return 1; }
+    [ -f "$CFG" ] && cp -p "$CFG" "$CFG.bak"
+    install -m 644 "$1" "$CFG"
+    rm -f "$1"
+}
+
+# Собирает конфиг из ключей, выходов и списка «напрямую» и перезапускает Xray.
+# Если Xray не поднялся — возвращает прежний конфиг. Перезапуск рвёт соединения на секунду
+# и обнуляет счётчики трафика.
+apply() {
+    [ -n "$(uuid_of "$CHECK_USER")" ] || printf '%s\t%s\t\n' "$CHECK_USER" "$("$XRAY" uuid)" >> "$KEYS"
+    local tmp; tmp=$(mktemp --suffix=.json)   # Xray с версии 26.10 проверяет только файлы .json
+    py render > "$tmp" || { rm -f "$tmp"; return 1; }
+    save_cfg "$tmp" || { echo "Новый конфиг не прошёл проверку xray." >&2; return 1; }
+    systemctl restart xray
+    sleep 1
+    if ! systemctl is-active -q xray; then
+        [ -f "$CFG.bak" ] && cp -p "$CFG.bak" "$CFG" && systemctl restart xray
+        echo "Xray не запустился с новым конфигом, вернул прежний. Смотри: journalctl -u xray -n 50" >&2
+        return 1
+    fi
+}
+
+# Изменение с откатом: копия файлов состояния, правка, apply; при ошибке всё возвращается.
+STATE=("$KEYS" "$DIRECT" "$ENV")
+snap()   { local f; for f in "${STATE[@]}"; do cp -p "$f" "$f.prev"; done; rm -rf "$EXITS.prev"; cp -a "$EXITS" "$EXITS.prev"; }
+unsnap() { local f; for f in "${STATE[@]}"; do mv -f "$f.prev" "$f"; done; rm -rf "$EXITS"; mv "$EXITS.prev" "$EXITS"; }
+commit() { apply || { unsnap; die "Ничего не изменено."; }; local f; for f in "${STATE[@]}"; do rm -f "$f.prev"; done; rm -rf "$EXITS.prev"; }
+
+link_of() {
+    local u; u=$(uuid_of "$1")
+    [ -n "$u" ] || die "Ключа «$1» нет. Список: vpn list"
+    local p; p=$(printf %s "$XPATH" | sed 's#/#%2F#g')
+    echo "vless://$u@$(server_ip):443?encryption=none&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=xhttp&path=$p&mode=auto#$LABEL-$1"
+}
+
+show_link() {
+    local l; l=$(link_of "$1")
+    echo; echo "Ссылка ключа «$1» (выход: $(exit_label "$(exit_of "$1")")):"
+    echo "$l"; echo
+    qrencode -t ansiutf8 -m 2 "$l"
+    echo "В Happ или v2RayTun: «+» → «Вставить из буфера» или «Сканировать QR»."
+}
+
+exit_label() {
+    case "${1:-}" in
+        auto) echo "любой живой" ;;
+        "") echo "${DEFAULT_EXIT:-нет} (по умолчанию)" ;;
+        *) if has_exit "$1"; then echo "$1"; else echo "${DEFAULT_EXIT:-нет} (выхода $1 нет)"; fi ;;
+    esac
+}
+
+human() { numfmt --to=iec --suffix=B "${1:-0}"; }
+pad()  { local s=$1 w=$2; printf '%s%*s' "$s" $(( w > ${#s} ? w - ${#s} : 0 )) ''; }
+lpad() { local s=$1 w=$2; printf '%*s%s' $(( w > ${#s} ? w - ${#s} : 0 )) '' "$s"; }
+
+cmd_list() {
+    local stats online n ex down up on
+    stats=$("$XRAY" api statsquery -s "$API" -pattern 'user>>>' 2>/dev/null || echo '{}')
+    online=$("$XRAY" api statsgetallonlineusers -s "$API" 2>/dev/null || echo '{}')
+    echo "$(pad КЛЮЧ 20) $(pad ВЫХОД 22) $(pad СЕЙЧАС 8) $(lpad СКАЧАНО 9) $(lpad ОТДАНО 9)"
+    while read -r n; do
+        [ -n "$n" ] || continue
+        ex=$(exit_label "$(exit_of "$n")")
+        down=$(jq -r --arg k "user>>>$n>>>traffic>>>downlink" '[.stat[]? | select(.name==$k) | .value | tonumber] | add // 0' <<<"$stats")
+        up=$(jq -r --arg k "user>>>$n>>>traffic>>>uplink" '[.stat[]? | select(.name==$k) | .value | tonumber] | add // 0' <<<"$stats")
+        on=$(grep -q "user>>>$n>>>online" <<<"$online" && echo "онлайн" || echo "-")
+        echo "$(pad "$n" 20) $(pad "$ex" 22) $(pad "$on" 8) $(lpad "$(human "$down")" 9) $(lpad "$(human "$up")" 9)"
+    done < <(clients)
+    echo "Счётчики — с запуска xray: $(systemctl show xray -p ActiveEnterTimestamp --value)"
+}
+
+cmd_add() {
+    check_name "${1:-}" add
+    [ -z "$(uuid_of "$1")" ] || die "Ключ «$1» уже есть. Показать: vpn link $1"
+    local ex=${2:-}
+    [ -z "$ex" ] || [ "$ex" = auto ] || has_exit "$ex" || die "Выхода «$ex» нет. Список: vpn exit"
+    snap
+    printf '%s\t%s\t%s\n' "$1" "$("$XRAY" uuid)" "$ex" >> "$KEYS"
+    commit
+    echo "Ключ «$1» добавлен."
+    show_link "$1"
+}
+
+cmd_del() {
+    check_name "${1:-}" del
+    [ -n "$(uuid_of "$1")" ] || die "Ключа «$1» нет. Список: vpn list"
+    snap
+    awk -F'\t' -v n="$1" '$1!=n' "$KEYS.prev" > "$KEYS"
+    commit
+    echo "Ключ «$1» отключён, его ссылка больше не работает."
+}
+
+cmd_route() {
+    check_name "${1:-}" route
+    [ -n "$(uuid_of "$1")" ] || die "Ключа «$1» нет. Список: vpn list"
+    local ex=${2:-}
+    [ -n "$ex" ] || die "Укажи выход: vpn route $1 <выход|auto|default>. Выходы: vpn exit"
+    [ "$ex" = default ] && ex=""
+    [ -z "$ex" ] || [ "$ex" = auto ] || has_exit "$ex" || die "Выхода «$ex» нет. Список: vpn exit"
+    snap
+    awk -F'\t' -v OFS='\t' -v n="$1" -v e="$ex" '$1==n {$3=e} {print}' "$KEYS.prev" > "$KEYS"
+    commit
+    echo "Ключ «$1» теперь выходит через: $(exit_label "$ex"). Ссылка та же."
+}
+
+cmd_exit() {
+    case "${1:-}" in
+        ""|list)
+            local e
+            if [ -z "$(exits)" ]; then echo "Выходов нет. Добавить: vpn exit add <имя> <ссылка vless://>"; return; fi
+            echo "Выходы (по умолчанию: ${DEFAULT_EXIT:-$(exits | head -1)}):"
+            while read -r e; do
+                echo "  $e — путей: $(grep -c '^vless://' "$EXITS/$e"), ключей: $(awk -F'\t' -v e="$e" '$3==e' "$KEYS" | grep -c . || true)"
+                sed -n 's#^vless://[^@]*@\([^?]*\)?.*#      → \1#p' "$EXITS/$e"
+            done < <(exits)
+            ;;
+        add)
+            check_name "${2:-}" "exit add"
+            local l=${3:-}
+            [[ "$l" == vless://* ]] || die "Нужна ссылка: vpn exit add $2 'vless://...'. Её даёт vpn add <имя> на заграничном сервере."
+            py outbound "$l" probe >/dev/null || die "Ссылку не удалось разобрать."
+            grep -qxF "$l" "$EXITS/$2" 2>/dev/null && { echo "Эта ссылка у выхода «$2» уже есть."; return; }
+            snap
+            echo "$l" >> "$EXITS/$2"
+            [ -n "$DEFAULT_EXIT" ] || set_env DEFAULT_EXIT "$2"
+            commit
+            echo "Выход «$2»: путей $(grep -c '^vless://' "$EXITS/$2"). Проверить: vpn check"
+            ;;
+        del)
+            check_name "${2:-}" "exit del"
+            has_exit "$2" || die "Выхода «$2» нет."
+            snap
+            rm -f "$EXITS/$2"
+            awk -F'\t' -v OFS='\t' -v e="$2" '$3==e {$3=""} {print}' "$KEYS.prev" > "$KEYS"
+            [ "$DEFAULT_EXIT" != "$2" ] || set_env DEFAULT_EXIT "$(exits | head -1)"
+            commit
+            echo "Выход «$2» удалён. Его ключи идут через выход по умолчанию: ${DEFAULT_EXIT:-нет}."
+            ;;
+        default)
+            check_name "${2:-}" "exit default"
+            has_exit "$2" || die "Выхода «$2» нет."
+            snap; set_env DEFAULT_EXIT "$2"; commit
+            echo "Выход по умолчанию: $2."
+            ;;
+        *) die "vpn exit [list] | add <имя> <ссылка> | del <имя> | default <имя>" ;;
+    esac
+}
+
+# Сайт для списка «напрямую»: домен (с поддоменами), IP или подсеть, geosite:/geoip:/full:/keyword:.
+norm_site() {
+    local s; s=$(printf %s "$1" | tr 'A-Z' 'a-z' | sed 's#^[a-z]*://##; s#/.*##; s#:[0-9]*$##; s#^\*\.##')
+    [[ "$1" =~ ^(geosite|geoip|domain|full|keyword|regexp): ]] && s=$1
+    [[ "$s" =~ ^(geosite|geoip|domain|full|keyword|regexp):.+$ || "$s" =~ ^([a-z0-9-]+\.)+[a-z0-9-]{2,}$ \
+       || "$s" =~ ^[0-9.]+(/[0-9]+)?$ || "$s" =~ ^[0-9a-f:]+(/[0-9]+)?$ ]] \
+        || die "«$1» не похоже на сайт. Примеры: ozon.ru, 1.2.3.4, 10.0.0.0/8, geosite:apple"
+    echo "$s"
+}
+
+cmd_direct() {
+    case "${1:-}" in
+        ""|list)
+            echo "Напрямую с этого сервера (с российского IP), мимо выходов:"
+            echo "  всегда: российские сайты (geosite:category-ru) и адреса (geoip:ru)"
+            if grep -q . "$DIRECT"; then sed 's/^/  /' "$DIRECT"; else echo "  своих сайтов нет. Добавить: vpn direct add ozon.ru"; fi
+            ;;
+        add)
+            shift; [ $# -gt 0 ] || die "Укажи сайты: vpn direct add ozon.ru wb.ru"
+            local s added=0
+            snap
+            for s in "$@"; do
+                s=$(norm_site "$s") || { unsnap; exit 1; }
+                grep -qxF "$s" "$DIRECT" || { echo "$s" >> "$DIRECT"; added=$((added + 1)); }
+            done
+            [ "$added" -gt 0 ] || { unsnap; echo "Эти сайты уже в списке."; return; }
+            commit
+            echo "Добавлено: $added. Действует сразу для всех ключей."
+            ;;
+        del)
+            shift; [ $# -gt 0 ] || die "Укажи сайт: vpn direct del ozon.ru"
+            snap
+            local s
+            for s in "$@"; do s=$(norm_site "$s") || { unsnap; exit 1; }; grep -vxF "$s" "$DIRECT" > "$DIRECT.tmp" || true; mv "$DIRECT.tmp" "$DIRECT"; done
+            commit
+            echo "Готово. Список: vpn direct"
+            ;;
+        *) die "vpn direct [list] | add <сайт>... | del <сайт>..." ;;
+    esac
+}
+
+# Сайт для маскировки годится, если отвечает по TLS 1.3 и HTTP/2. Печатает время рукопожатия.
+sni_ok() { curl -s -o /dev/null --tlsv1.3 --http2 -m 8 -w '%{http_version} %{time_appconnect}' "https://$1/" 2>/dev/null | awk '$1=="2"{print $2; ok=1} END{exit !ok}'; }
+
+cmd_sni() {
+    [ -n "${1:-}" ] || { echo "Маскировка: $SNI"; echo "Сменить: vpn sni <домен>. Все ссылки после этого придётся выдать заново."; return; }
+    local d; d=$(printf %s "$1" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##')
+    sni_ok "$d" >/dev/null || die "$d не отвечает по TLS 1.3 + HTTP/2, для маскировки не подходит."
+    snap; set_env SNI "$d"; commit
+    echo "Маскировка: $d. Ссылки изменились — выдай их заново: vpn link <имя>"
+}
+
+# Временный клиент Xray с одним исходящим соединением; печатает «IP скорость_Мбит/с».
+probe() {
+    local tmp port=10899 pid ip speed
+    tmp=$(mktemp --suffix=.json)
+    jq -n --argjson o "$1" --argjson port $port '{log:{loglevel:"none"},
+        inbounds:[{listen:"127.0.0.1",port:$port,protocol:"socks"}], outbounds:[$o]}' > "$tmp"
+    "$XRAY" run -config "$tmp" >/dev/null 2>&1 & pid=$!
+    sleep 2
+    ip=$(curl -s -m 15 --socks5-hostname 127.0.0.1:$port https://api.ipify.org || true)
+    speed=0
+    # Скорость: первый адрес, который отдал файл. Hetzner бывает закрыт из российских сетей,
+    # а Cloudflare отвечает 403 некоторым хостингам, поэтому их несколько.
+    local u r
+    [ -z "$ip" ] || for u in https://proof.ovh.net/files/100Mb.dat https://fsn1-speed.hetzner.com/100MB.bin \
+            'https://speed.cloudflare.com/__down?bytes=100000000'; do
+        r=$(curl -s -m 20 --socks5-hostname 127.0.0.1:$port -o /dev/null -w '%{http_code} %{speed_download}' "$u" || true)
+        [ "${r%% *}" = 200 ] && { speed=${r#* }; break; }
+    done
+    kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -f "$tmp"
+    [ -n "$ip" ] && echo "$ip $(( ${speed%.*} * 8 / 1000000 ))"
+}
+
+cmd_check() {
+    local ok=1 r
+    if systemctl is-active -q xray; then echo "✓ xray работает"; else echo "✗ xray не работает"; ok=0; fi
+    if r=$(sni_ok "$SNI"); then echo "✓ маскировка $SNI отвечает (TLS 1.3, h2, ${r} с)"
+    else echo "✗ маскировка $SNI не отвечает по TLS 1.3 + h2 — смени: vpn sni <домен>"; ok=0; fi
+
+    local e i l
+    if [ -z "$(exits)" ]; then echo "✗ нет ни одного выхода — vpn exit add <имя> <ссылка>"; ok=0; fi
+    while read -r e; do
+        [ -n "$e" ] || continue
+        i=0
+        while read -r l; do
+            i=$((i + 1))
+            local where; where=$(sed 's#^vless://[^@]*@\([^?]*\)?.*#\1#' <<<"$l")
+            if r=$(probe "$(py outbound "$l" out)"); then echo "✓ выход $e ($where): выход с ${r% *}, ~${r#* } Мбит/с"
+            else echo "✗ выход $e ($where) не отвечает"; ok=0; fi
+        done < <(grep '^vless://' "$EXITS/$e")
+    done < <(exits)
+
+    # Весь путь, как у телефона: Reality на этот сервер снаружи, дальше — выход по умолчанию.
+    if [ -n "$(uuid_of "$CHECK_USER")" ] && [ -n "$(exits)" ]; then
+        if r=$(probe "$(py outbound "$(link_of "$CHECK_USER")" out)"); then
+            echo "✓ каскад целиком: вход $(server_ip) → выход с ${r% *}, ~${r#* } Мбит/с"
+        else echo "✗ каскад целиком не отвечает (Reality на $(server_ip):443)"; ok=0; fi
+    fi
+    echo "  ключей: $(clients | grep -c . || true), сайтов напрямую: $(grep -c . "$DIRECT" || true)"
+    echo "  память: $(free -m | awk '/Mem/{print $3"/"$2" МБ"}'), диск: $(df -h / | awk 'NR==2{print $3"/"$2}'), работает: $(uptime -p)"
+    [ "$ok" = 1 ] && echo "Всё в порядке." || { echo "Есть проблемы — смотри выше и journalctl -u xray -n 50."; return 1; }
+}
+
+# Вход на сервер по SSH — как на выходах.
+SSHD_CONF=/etc/ssh/sshd_config.d/00-vpn-setup.conf
+AUTH_KEYS=/root/.ssh/authorized_keys
+ssh_password_state() { sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2}'; }
+ssh_keys_count() { local n=0; [ -f "$AUTH_KEYS" ] && n=$(grep -cE '^(ssh-|ecdsa-)' "$AUTH_KEYS" || true); echo "${n:-0}"; }
+ssh_apply() {
+    printf '%s\n' "$@" > "$SSHD_CONF"
+    sshd -t || { rm -f "$SSHD_CONF"; die "sshd не принял настройку, ничего не изменено."; }
+    systemctl reload ssh
+}
+cmd_ssh() {
+    case "${1:-}" in
+        ""|status)
+            if [ "$(ssh_password_state)" = yes ]; then echo "Вход по паролю: включён"; else echo "Вход по паролю: выключен"; fi
+            echo "SSH-ключей на сервере: $(ssh_keys_count)"
+            echo "  vpn ssh password off|on   вход только по ключу / снова по паролю"
+            ;;
+        password)
+            case "${2:-}" in
+                off) [ "$(ssh_keys_count)" -gt 0 ] || die "На сервере нет SSH-ключа — без пароля на него будет не попасть."
+                     ssh_apply "PasswordAuthentication no" "KbdInteractiveAuthentication no" "PermitRootLogin prohibit-password" "PubkeyAuthentication yes"
+                     echo "Вход по паролю выключен. Проверь в новом окне, что входишь по ключу." ;;
+                on)  ssh_apply "PasswordAuthentication yes" "KbdInteractiveAuthentication no" "PermitRootLogin yes" "PubkeyAuthentication yes"
+                     echo "Вход по паролю включён." ;;
+                *) die "vpn ssh password off  или  vpn ssh password on" ;;
+            esac ;;
+        *) die "vpn ssh [status] | password off|on" ;;
+    esac
+}
+
+usage() {
+    cat <<EOF
+vpn — вход каскада $LABEL ($(server_ip)), маскировка под $SNI
+
+  vpn list                   ключи, их выходы, кто онлайн, трафик
+  vpn add <имя> [выход]      новый ключ: ссылка и QR (выход по умолчанию: ${DEFAULT_EXIT:-нет})
+  vpn link <имя>             снова показать ссылку
+  vpn del <имя>              отключить ключ
+  vpn route <имя> <выход>    сменить выход ключа (auto — любой живой, default — по умолчанию)
+  vpn exit                   выходы; vpn exit add <имя> <ссылка> | del <имя> | default <имя>
+  vpn direct                 сайты напрямую с российского IP; vpn direct add|del <сайт>...
+  vpn sni [домен]            сайт, под который маскируется вход
+  vpn check                  проверить вход, выходы и каскад целиком
+  vpn restart                перезапустить xray
+  vpn ssh                    вход на сервер по паролю или ключу
+EOF
+}
+
+case "${1:-}" in
+    add)     cmd_add "${2:-}" "${3:-}" ;;
+    del|rm)  cmd_del "${2:-}" ;;
+    link|qr) [ -n "${2:-}" ] || die "Укажи имя: vpn link <имя>"; show_link "$2" ;;
+    list|ls|stats) cmd_list ;;
+    route)   cmd_route "${2:-}" "${3:-}" ;;
+    exit|exits) shift; cmd_exit "$@" ;;
+    direct)  shift; cmd_direct "$@" ;;
+    sni)     cmd_sni "${2:-}" ;;
+    check)   cmd_check ;;
+    apply)   apply ;;
+    render)  py render ;;
+    restart) systemctl restart xray; echo "xray перезапущен." ;;
+    ssh)     shift; cmd_ssh "$@" ;;
+    *)       usage ;;
+esac
