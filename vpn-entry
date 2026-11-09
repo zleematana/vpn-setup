@@ -10,19 +10,21 @@ CHECK_USER=_check   # служебный ключ для vpn check, в спис�
 XRAY=/usr/local/bin/xray
 XDIR=${VPN_XDIR:-/usr/local/etc/xray}
 CFG=$XDIR/config.json
-ENV=$XDIR/entry.env        # LABEL, SNI, PRIV, PUB, SID, XPATH, DEFAULT_EXIT
+ENV=$XDIR/entry.env        # LABEL, SNI, PRIV, PUB, SID, XPATH, DEFAULT_EXIT, SUB_DOMAIN, SUB_TITLE
 KEYS=$XDIR/keys.tsv        # имя <TAB> uuid <TAB> выход
 EXITS=$XDIR/exits          # файл на выход, в нём ссылки vless:// — по одной на путь
 DIRECT=$XDIR/direct.list   # сайты, которые идут напрямую с этого сервера, мимо выходов
 API=127.0.0.1:10085
 TAG=reality-in
+SUBDIR=/var/www/sub        # файлы подписок, их раздаёт nginx по https://$SUB_DOMAIN/s/<токен>
+XRAY_LOCAL=4443            # с подписками Xray слушает 127.0.0.1:4443, а 443 делит nginx
 
 die() { echo "$*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "Запускай от root."
 [ -f "$ENV" ] || die "Нет $ENV — вход не настроен (install.sh, роль «вход»)."
 # shellcheck disable=SC1090
 . "$ENV"
-LABEL=${LABEL:-ru} DEFAULT_EXIT=${DEFAULT_EXIT:-}
+LABEL=${LABEL:-ru} DEFAULT_EXIT=${DEFAULT_EXIT:-} SUB_DOMAIN=${SUB_DOMAIN:-} SUB_TITLE=${SUB_TITLE:-VPN}
 mkdir -p "$EXITS"; touch "$KEYS" "$DIRECT"
 
 NAME_RE='^[a-z0-9][a-z0-9_-]{0,31}$'
@@ -52,9 +54,10 @@ server_ip() {
 
 # Разбор ссылок и сборка конфига — на Python: в bash разбирать URL ненадёжно.
 py() {
-    XDIR=$XDIR SNI=${SNI:-} PRIV=${PRIV:-} SID=${SID:-} XPATH=${XPATH:-} DEFAULT_EXIT=$DEFAULT_EXIT \
+    XDIR=$XDIR SNI=${SNI:-} PRIV=${PRIV:-} PUB=${PUB:-} SID=${SID:-} XPATH=${XPATH:-} DEFAULT_EXIT=$DEFAULT_EXIT \
+    LABEL=$LABEL SUB_DOMAIN=$SUB_DOMAIN SUB_TITLE=$SUB_TITLE SUBDIR=$SUBDIR IP=${IP:-} XRAY_LOCAL=$XRAY_LOCAL NGX_STREAM=$NGX_STREAM \
     python3 - "$@" <<'PY'
-import ipaddress, json, os, re, sys, urllib.parse as up
+import base64, hashlib, ipaddress, json, os, re, sys, tempfile, urllib.parse as up
 
 def fail(msg):
     print(msg, file=sys.stderr); sys.exit(1)
@@ -118,13 +121,76 @@ def direct_rules(path):
         rules.append({"ip": ips, "outboundTag": "direct"})
     return rules
 
-def render():
-    E, xdir = os.environ, os.environ["XDIR"]
+def read_keys():
     keys = []
-    for line in open(f"{xdir}/keys.tsv", encoding="utf-8"):
+    for line in open(f"{os.environ['XDIR']}/keys.tsv", encoding="utf-8"):
         p = line.rstrip("\n").split("\t")
         if len(p) >= 2 and p[0]:
             keys.append((p[0], p[1], p[2] if len(p) > 2 and p[2] else ""))
+    return keys
+
+# Ссылка на вход для ключа: адрес — домен подписок или IP, маскировка — сайт из SNI.
+def link(uuid, addr, name):
+    E = os.environ
+    return (f"vless://{uuid}@{addr}:443?encryption=none&security=reality&sni={E['SNI']}&fp=chrome"
+            f"&pbk={E['PUB']}&sid={E['SID']}&type=xhttp&path={up.quote(E['XPATH'], safe='')}"
+            f"&mode=auto#{up.quote(name)}")
+
+def token(uuid):
+    return hashlib.sha256(f"sub:{uuid}".encode()).hexdigest()[:32]
+
+def write_atomic(path, data):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(data)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+# Подписки: Happ и v2RayTun получают конфиг Xray с двумя путями к этому же входу
+# (через домен и прямо на IP) и балансировщиком, остальные приложения — обе ссылки в base64.
+# Только каскад: прямых путей на выходы в подписке нет.
+def subs():
+    E, d = os.environ, os.environ["SUBDIR"]
+    os.makedirs(d, exist_ok=True)
+    os.chmod(d, 0o711)
+    private = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
+               "169.254.0.0/16", "fc00::/7", "fe80::/10"]
+    keep = set()
+    for name, u, _ in read_keys():
+        if name.startswith("_"):
+            continue
+        t = token(u)
+        keep.add(t)
+        title = f"{E['SUB_TITLE']}"
+        paths = [(E["SUB_DOMAIN"], "proxy-domain"), (E["IP"], "proxy-ip")]
+        cfg = {
+            "remarks": title,
+            "log": {"loglevel": "warning"},
+            "inbounds": [
+                {"tag": "socks", "listen": "127.0.0.1", "port": 10808, "protocol": "socks", "settings": {"udp": True},
+                 "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}},
+                {"tag": "http", "listen": "127.0.0.1", "port": 10809, "protocol": "http"}],
+            "outbounds": [outbound(link(u, a, title), tag) for a, tag in paths]
+                         + [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
+            "burstObservatory": {"subjectSelector": ["proxy-"], "pingConfig": {
+                "destination": "https://www.gstatic.com/generate_204", "interval": "30s", "timeout": "5s", "sampling": 2}},
+            "routing": {"domainStrategy": "AsIs",
+                        "balancers": [{"tag": "auto", "selector": ["proxy-"], "strategy": {"type": "leastPing"},
+                                       "fallbackTag": "proxy-domain"}],
+                        "rules": [{"ip": private, "outboundTag": "direct"},
+                                  {"network": "tcp,udp", "balancerTag": "auto"}]},
+        }
+        write_atomic(f"{d}/{t}.json", json.dumps([cfg], ensure_ascii=False))
+        links = "\n".join(link(u, a, f"{title} ({'основной' if tag == 'proxy-domain' else 'запасной'})")
+                          for a, tag in paths) + "\n"
+        write_atomic(f"{d}/{t}.txt", base64.b64encode(links.encode()).decode())
+    for f in os.listdir(d):
+        if f.endswith((".json", ".txt")) and f.rsplit(".", 1)[0] not in keep:
+            os.remove(f"{d}/{f}")
+
+def render():
+    E, xdir = os.environ, os.environ["XDIR"]
+    keys = read_keys()
     exits = {}
     for name in sorted(os.listdir(f"{xdir}/exits")):
         links = [l.strip() for l in open(f"{xdir}/exits/{name}", encoding="utf-8") if l.strip().startswith("vless://")]
@@ -162,7 +228,11 @@ def render():
         "api": {"tag": "api", "listen": "127.0.0.1:10085", "services": ["HandlerService", "StatsService"]},
         "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True, "statsUserOnline": True}}},
         "inbounds": [{
-            "tag": "reality-in", "port": 443, "protocol": "vless",
+            "tag": "reality-in", "protocol": "vless",
+            # С подписками порт 443 занимает nginx и по имени сайта отдаёт сюда всё, кроме подписок.
+            # Без его конфига (например, папку перенесли на новый сервер) Xray остаётся на 443.
+            **({"listen": "127.0.0.1", "port": int(E["XRAY_LOCAL"])}
+               if E.get("SUB_DOMAIN") and os.path.exists(E["NGX_STREAM"]) else {"port": 443}),
             "settings": {"clients": [{"id": u, "email": n} for n, u, _ in keys], "decryption": "none"},
             "streamSettings": {
                 "network": "xhttp", "security": "reality",
@@ -184,6 +254,12 @@ if cmd == "outbound":
     json.dump(outbound(sys.argv[2], sys.argv[3]), sys.stdout)
 elif cmd == "render":
     render()
+elif cmd == "subs":
+    subs()
+elif cmd == "token":
+    print(token(sys.argv[2]))
+elif cmd == "link":
+    print(link(sys.argv[2], sys.argv[3], sys.argv[4]))
 PY
 }
 
@@ -203,6 +279,9 @@ apply() {
     local tmp; tmp=$(mktemp --suffix=.json)   # Xray с версии 26.10 проверяет только файлы .json
     py render > "$tmp" || { rm -f "$tmp"; return 1; }
     save_cfg "$tmp" || { echo "Новый конфиг не прошёл проверку xray." >&2; return 1; }
+    # Несколько изменений подряд (например, ключи пачкой) упираются в лимит systemd
+    # «5 запусков за 10 секунд» — сбрасываем счётчик, раз перезапуск задуман.
+    systemctl reset-failed xray 2>/dev/null || true
     systemctl restart xray
     sleep 1
     if ! systemctl is-active -q xray; then
@@ -210,27 +289,157 @@ apply() {
         echo "Xray не запустился с новым конфигом, вернул прежний. Смотри: journalctl -u xray -n 50" >&2
         return 1
     fi
+    sub_build
+}
+
+# ---- Подписки ----
+# Адрес подписки: https://$SUB_DOMAIN/s/<токен>, токен выводится из ключа и нигде не хранится.
+sub_build() { [ -n "$SUB_DOMAIN" ] || return 0; IP=$(server_ip); IP=$IP py subs; }
+sub_url()   { echo "https://$SUB_DOMAIN/s/$(py token "$(uuid_of "$1")")"; }
+
+NGX_SUB=/etc/nginx/conf.d/vpn-sub.conf
+NGX_STREAM=/etc/nginx/vpn-stream.conf
+NGX_INCLUDE="include $NGX_STREAM;"
+
+dns_a() {
+    curl -s -m 5 -H 'accept: application/dns-json' "https://1.1.1.1/dns-query?name=$1&type=A" \
+        | jq -r '.Answer[]? | select(.type==1) | .data' 2>/dev/null | head -1
+}
+
+# nginx делит порт 443 по имени сайта: домен подписок — себе, всё остальное (VPN и
+# проверяющие, которым показывается сайт для маскировки) — в Xray на 127.0.0.1:4443.
+sub_nginx() {
+    local d=$1 title; title=$(printf %s "$SUB_TITLE" | base64 -w0)
+    cat > "$NGX_STREAM" <<EOF
+stream {
+    map \$ssl_preread_server_name \$vpn_backend {
+        $d 127.0.0.1:8443;
+        default 127.0.0.1:$XRAY_LOCAL;
+    }
+    server {
+        listen 443;
+        listen [::]:443;
+        ssl_preread on;
+        proxy_pass \$vpn_backend;
+        proxy_connect_timeout 5s;
+        proxy_timeout 1h;
+    }
+}
+EOF
+    cat > "$NGX_SUB" <<EOF
+map \$http_user_agent \$vpn_sub_ext {
+    default txt;
+    ~*(?:happ|v2raytun) json;
+}
+server {
+    listen 127.0.0.1:8443 ssl;
+    http2 on;
+    server_name $d;
+    ssl_certificate     /etc/letsencrypt/live/$d/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$d/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    server_tokens off;
+    access_log off;
+
+    location ~ "^/s/(?<vpn_sub>[0-9a-f]{32})\$" {
+        root $SUBDIR;
+        types { application/json json; text/plain txt; }
+        try_files /\$vpn_sub.\$vpn_sub_ext =404;
+        add_header Cache-Control "no-store" always;
+        add_header profile-title "base64:$title" always;
+        add_header profile-update-interval "6" always;
+    }
+    location / { return 404; }
+}
+EOF
+    grep -qxF "$NGX_INCLUDE" /etc/nginx/nginx.conf || echo "$NGX_INCLUDE" >> /etc/nginx/nginx.conf
+}
+
+sub_nginx_off() {
+    rm -f "$NGX_STREAM" "$NGX_SUB"
+    sed -i "\#^$NGX_INCLUDE\$#d" /etc/nginx/nginx.conf 2>/dev/null || true
+    systemctl stop nginx 2>/dev/null || true
+}
+
+cmd_sub() {
+    case "${1:-}" in
+        "")
+            if [ -z "$SUB_DOMAIN" ]; then
+                echo "Подписки выключены. Включить: vpn sub domain <домен> (A-запись домена — на $(server_ip))."
+            else
+                sub_build; echo "Подписки пересобраны ($(clients | grep -c . || true) ключей), адрес: https://$SUB_DOMAIN/s/…"
+            fi ;;
+        domain)
+            local d; d=$(printf %s "${2:-}" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##')
+            [[ "$d" =~ ^([a-z0-9-]+\.)+[a-z]{2,}$ ]] || die "Укажи домен: vpn sub domain sub.example.com"
+            local ip a; ip=$(server_ip); a=$(dns_a "$d")
+            [ "$a" = "$ip" ] || die "A-запись $d должна указывать на $ip, сейчас: ${a:-нет записи}. В Cloudflare — серое облако (DNS only)."
+            echo "== nginx и certbot"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx libnginx-mod-stream certbot >/dev/null
+            rm -f /etc/nginx/sites-enabled/default
+            systemctl stop nginx
+            if [ ! -f "/etc/letsencrypt/live/$d/fullchain.pem" ]; then
+                echo "== Сертификат (порт 80 открывается только на время проверки)"
+                certbot certonly -q --standalone -d "$d" --agree-tos --register-unsafely-without-email -n \
+                    --pre-hook "ufw allow 80/tcp" --post-hook "ufw delete allow 80/tcp" \
+                    --deploy-hook "systemctl reload nginx" || die "Сертификат не получен, ничего не изменено."
+            fi
+            echo "== Порт 443: подписки — nginx, остальное — Xray"
+            sub_nginx "$d"
+            nginx -t -q 2>/dev/null || { sub_nginx_off; die "Конфиг nginx не прошёл проверку, ничего не изменено."; }
+            snap; set_env SUB_DOMAIN "$d"
+            if ! apply; then unsnap; sub_nginx_off; die "Xray не перешёл на 127.0.0.1:$XRAY_LOCAL, вернул как было."; fi
+            commit_files
+            systemctl enable -q nginx
+            if ! systemctl restart nginx; then
+                sub_nginx_off; set_env SUB_DOMAIN ""; apply || true
+                die "nginx не запустился, вернул Xray на 443. Смотри: journalctl -u nginx -n 30"
+            fi
+            echo "Подписки включены: https://$d/s/… Показать подписку ключа: vpn link <имя>"
+            ;;
+        off)
+            [ -n "$SUB_DOMAIN" ] || { echo "Подписки и так выключены."; return; }
+            sub_nginx_off
+            snap; set_env SUB_DOMAIN ""; commit
+            echo "Подписки выключены, Xray снова на 443. Ссылки по IP работают, подписки — нет."
+            ;;
+        *) die "vpn sub | sub domain <домен> | sub off" ;;
+    esac
 }
 
 # Изменение с откатом: копия файлов состояния, правка, apply; при ошибке всё возвращается.
 STATE=("$KEYS" "$DIRECT" "$ENV")
 snap()   { local f; for f in "${STATE[@]}"; do cp -p "$f" "$f.prev"; done; rm -rf "$EXITS.prev"; cp -a "$EXITS" "$EXITS.prev"; }
 unsnap() { local f; for f in "${STATE[@]}"; do mv -f "$f.prev" "$f"; done; rm -rf "$EXITS"; mv "$EXITS.prev" "$EXITS"; }
-commit() { apply || { unsnap; die "Ничего не изменено."; }; local f; for f in "${STATE[@]}"; do rm -f "$f.prev"; done; rm -rf "$EXITS.prev"; }
+commit_files() { local f; for f in "${STATE[@]}"; do rm -f "$f.prev"; done; rm -rf "$EXITS.prev"; }
+commit() { apply || { unsnap; die "Ничего не изменено."; }; commit_files; }
 
+# Ссылка ключа $1 на вход; $2 — адрес (по умолчанию IP сервера).
 link_of() {
     local u; u=$(uuid_of "$1")
     [ -n "$u" ] || die "Ключа «$1» нет. Список: vpn list"
-    local p; p=$(printf %s "$XPATH" | sed 's#/#%2F#g')
-    echo "vless://$u@$(server_ip):443?encryption=none&security=reality&sni=$SNI&fp=chrome&pbk=$PUB&sid=$SID&type=xhttp&path=$p&mode=auto#$LABEL-$1"
+    py link "$u" "${2:-$(server_ip)}" "$LABEL-$1"
 }
 
 show_link() {
-    local l; l=$(link_of "$1")
-    echo; echo "Ссылка ключа «$1» (выход: $(exit_label "$(exit_of "$1")")):"
-    echo "$l"; echo
-    qrencode -t ansiutf8 -m 2 "$l"
-    echo "В Happ или v2RayTun: «+» → «Вставить из буфера» или «Сканировать QR»."
+    [ -n "$(uuid_of "$1")" ] || die "Ключа «$1» нет. Список: vpn list"
+    echo; echo "Ключ «$1», выход: $(exit_label "$(exit_of "$1")")."
+    if [ -n "$SUB_DOMAIN" ]; then
+        sub_build
+        local s; s=$(sub_url "$1")
+        echo "Подписка — добавляется в приложение один раз, дальше настройки обновляются сами:"
+        echo "$s"; echo
+        qrencode -t ansiutf8 -m 2 "$s"
+        echo "В Happ или v2RayTun: «+» → «Вставить из буфера» или «Сканировать QR»."
+        echo
+        echo "Если приложение не умеет подписки — ссылка:"
+        link_of "$1" "$SUB_DOMAIN"
+    else
+        local l; l=$(link_of "$1")
+        echo "$l"; echo
+        qrencode -t ansiutf8 -m 2 "$l"
+        echo "В Happ или v2RayTun: «+» → «Вставить из буфера» или «Сканировать QR»."
+    fi
 }
 
 exit_label() {
@@ -387,7 +596,8 @@ cmd_sni() {
     local d; d=$(printf %s "$1" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##')
     sni_ok "$d" >/dev/null || die "$d не отвечает по TLS 1.3 + HTTP/2, для маскировки не подходит."
     snap; set_env SNI "$d"; commit
-    echo "Маскировка: $d. Ссылки изменились — выдай их заново: vpn link <имя>"
+    if [ -n "$SUB_DOMAIN" ]; then echo "Маскировка: $d. Подписки обновлены, приложения подхватят сами (до 6 часов)."
+    else echo "Маскировка: $d. Ссылки изменились — выдай их заново: vpn link <имя>"; fi
 }
 
 # Временный клиент Xray с одним исходящим соединением; печатает «IP скорость_Мбит/с».
@@ -437,6 +647,26 @@ cmd_check() {
             echo "✓ каскад целиком: вход $(server_ip) → выход с ${r% *}, ~${r#* } Мбит/с"
         else echo "✗ каскад целиком не отвечает (Reality на $(server_ip):443)"; ok=0; fi
     fi
+    if [ -n "$SUB_DOMAIN" ]; then
+        local end days n url
+        if systemctl is-active -q nginx; then echo "✓ nginx работает (порт 443: подписки и VPN)"; else echo "✗ nginx не работает — VPN недоступен снаружи"; ok=0; fi
+        end=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$SUB_DOMAIN/fullchain.pem" 2>/dev/null | cut -d= -f2)
+        days=$(( ( $(date -d "${end:-now}" +%s) - $(date +%s) ) / 86400 ))
+        if [ "$days" -ge 14 ]; then echo "✓ сертификат $SUB_DOMAIN ещё $days дн."; else echo "✗ сертификат $SUB_DOMAIN истекает через $days дн."; ok=0; fi
+        n=$(clients | head -1)
+        if [ -n "$n" ]; then
+            sub_build; url=$(sub_url "$n")
+            if ! curl -s -m 10 -A "Happ/1.0" --resolve "$SUB_DOMAIN:443:$(server_ip)" "$url" | jq -e '.[0].outbounds' >/dev/null 2>&1; then
+                echo "✗ подписки не отдаются (https://$SUB_DOMAIN/s/…)"; ok=0
+            elif ! curl -s -m 10 --resolve "$SUB_DOMAIN:443:$(server_ip)" "$url" | base64 -d 2>/dev/null | grep -q '^vless://'; then
+                echo "✗ подписка отдаёт Happ конфиг, а остальным приложениям — не ссылки"; ok=0
+            else
+                echo "✓ подписки отдаются (https://$SUB_DOMAIN/s/…)"
+            fi
+            [ "$(dns_a "$SUB_DOMAIN")" = "$(server_ip)" ] && echo "✓ $SUB_DOMAIN указывает на этот сервер" \
+                || { echo "✗ $SUB_DOMAIN указывает не на этот сервер ($(dns_a "$SUB_DOMAIN")) — поправь A-запись"; ok=0; }
+        fi
+    fi
     echo "  ключей: $(clients | grep -c . || true), сайтов напрямую: $(grep -c . "$DIRECT" || true)"
     echo "  память: $(free -m | awk '/Mem/{print $3"/"$2" МБ"}'), диск: $(df -h / | awk 'NR==2{print $3"/"$2}'), работает: $(uptime -p)"
     [ "$ok" = 1 ] && echo "Всё в порядке." || { echo "Есть проблемы — смотри выше и journalctl -u xray -n 50."; return 1; }
@@ -477,8 +707,9 @@ usage() {
 vpn — вход каскада $LABEL ($(server_ip)), маскировка под $SNI
 
   vpn list                   ключи, их выходы, кто онлайн, трафик
-  vpn add <имя> [выход]      новый ключ: ссылка и QR (выход по умолчанию: ${DEFAULT_EXIT:-нет})
-  vpn link <имя>             снова показать ссылку
+  vpn add <имя> [выход]      новый ключ: подписка (или ссылка) и QR (выход по умолчанию: ${DEFAULT_EXIT:-нет})
+  vpn link <имя>             снова показать подписку или ссылку
+  vpn sub                    пересобрать подписки; vpn sub domain <домен> — включить, vpn sub off — выключить
   vpn del <имя>              отключить ключ
   vpn route <имя> <выход>    сменить выход ключа (auto — любой живой, default — по умолчанию)
   vpn exit                   выходы; vpn exit add <имя> <ссылка> | del <имя> | default <имя>
@@ -499,6 +730,7 @@ case "${1:-}" in
     exit|exits) shift; cmd_exit "$@" ;;
     direct)  shift; cmd_direct "$@" ;;
     sni)     cmd_sni "${2:-}" ;;
+    sub)     shift; cmd_sub "$@" ;;
     check)   cmd_check ;;
     apply)   apply ;;
     render)  py render ;;
