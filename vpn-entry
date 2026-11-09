@@ -240,7 +240,9 @@ def render():
                                     "privateKey": E["PRIV"], "shortIds": [E["SID"]]},
                 "xhttpSettings": {"path": E["XPATH"], "mode": "auto"}},
             "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}}],
-        "outbounds": outs + [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
+        # Первый исходящий Xray берёт, если ни одно правило не сработало. Пусть это будет
+        # блокировка: трафик не уйдёт ни напрямую с российского адреса, ни на чужой выход.
+        "outbounds": [{"tag": "block", "protocol": "blackhole"}] + outs + [{"tag": "direct", "protocol": "freedom"}],
         "routing": {"domainStrategy": "IPIfNonMatch", "balancers": bal, "rules": rules},
     }
     if outs:
