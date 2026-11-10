@@ -14,6 +14,7 @@ ENV=$XDIR/entry.env        # LABEL, SNI, PRIV, PUB, SID, XPATH, DEFAULT_EXIT, SU
 KEYS=$XDIR/keys.tsv        # имя <TAB> uuid <TAB> выход
 EXITS=$XDIR/exits          # файл на выход, в нём ссылки vless:// — по одной на путь
 DIRECT=$XDIR/direct.list   # сайты, которые идут напрямую с этого сервера, мимо выходов
+ABROAD=$XDIR/abroad.list   # сайты, которые идут через выход, даже если они российские
 API=127.0.0.1:10085
 TAG=reality-in
 SUBDIR=/var/www/sub        # файлы подписок, их раздаёт nginx по https://$SUB_DOMAIN/s/<токен>
@@ -25,7 +26,7 @@ die() { echo "$*" >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$ENV"
 LABEL=${LABEL:-ru} DEFAULT_EXIT=${DEFAULT_EXIT:-} SUB_DOMAIN=${SUB_DOMAIN:-} SUB_TITLE=${SUB_TITLE:-VPN}
-mkdir -p "$EXITS"; touch "$KEYS" "$DIRECT"
+mkdir -p "$EXITS"; touch "$KEYS" "$DIRECT" "$ABROAD"
 
 NAME_RE='^[a-z0-9][a-z0-9_-]{0,31}$'
 check_name() {
@@ -101,8 +102,12 @@ def outbound(link, tag):
             "settings": {"vnext": [{"address": u.hostname, "port": u.port or 443, "users": [user]}]},
             "streamSettings": ss}
 
-def direct_rules(path):
+# Условия маршрутизации из списка сайтов: домены и адреса отдельно (в одном правиле Xray
+# они складывались бы через «и»).
+def site_conds(path):
     dom, ips = [], []
+    if not os.path.exists(path):
+        return []
     for raw in open(path, encoding="utf-8"):
         s = raw.split("#")[0].strip()
         if not s:
@@ -114,12 +119,7 @@ def direct_rules(path):
         except ValueError:
             pass
         dom.append(s if re.match(r"^(geosite|domain|full|keyword|regexp):", s) else "domain:" + s)
-    rules = []
-    if dom:
-        rules.append({"domain": dom, "outboundTag": "direct"})
-    if ips:
-        rules.append({"ip": ips, "outboundTag": "direct"})
-    return rules
+    return ([{"domain": dom}] if dom else []) + ([{"ip": ips}] if ips else [])
 
 def read_keys():
     keys = []
@@ -207,20 +207,27 @@ def render():
                     "fallbackTag": outs[0]["tag"]})
     default = E.get("DEFAULT_EXIT") if E.get("DEFAULT_EXIT") in exits else next(iter(exits), None)
 
-    rules = [{"ip": ["geoip:private"], "outboundTag": "block"},
-             {"protocol": ["bittorrent"], "outboundTag": "block"}]
-    rules += direct_rules(f"{xdir}/direct.list")
-    rules += [{"domain": ["geosite:category-ru"], "outboundTag": "direct"},
-              {"ip": ["geoip:ru"], "outboundTag": "direct"}]
     by_exit = {}
     for name, _, ex in keys:
         ex = ex if ex == "auto" or ex in exits else default
         if ex and ex != default:
             by_exit.setdefault(ex, []).append(name)
-    for ex, users in by_exit.items():
-        rules.append({"user": users, "balancerTag": f"b.{ex}"})
-    rules.append({"network": "tcp,udp", "balancerTag": f"b.{default}"} if default
-                 else {"network": "tcp,udp", "outboundTag": "block"})
+
+    # Трафик под условием cond — каждому ключу через его выход, остальным через выход по умолчанию.
+    def via_exits(cond):
+        out = [{**cond, "user": users, "balancerTag": f"b.{ex}"} for ex, users in by_exit.items()]
+        out.append({**cond, "balancerTag": f"b.{default}"} if default else {**cond, "outboundTag": "block"})
+        return out
+
+    rules = [{"ip": ["geoip:private"], "outboundTag": "block"},
+             {"protocol": ["bittorrent"], "outboundTag": "block"}]
+    # vpn abroad: российские сайты, которым нужен заграничный адрес, — раньше правил «напрямую».
+    for cond in site_conds(f"{xdir}/abroad.list"):
+        rules += via_exits(cond)
+    rules += [{**c, "outboundTag": "direct"} for c in site_conds(f"{xdir}/direct.list")]
+    rules += [{"domain": ["geosite:category-ru"], "outboundTag": "direct"},
+              {"ip": ["geoip:ru"], "outboundTag": "direct"}]
+    rules += via_exits({"network": "tcp,udp"})
 
     cfg = {
         "log": {"loglevel": "warning", "access": "none"},
@@ -410,7 +417,7 @@ cmd_sub() {
 }
 
 # Изменение с откатом: копия файлов состояния, правка, apply; при ошибке всё возвращается.
-STATE=("$KEYS" "$DIRECT" "$ENV")
+STATE=("$KEYS" "$DIRECT" "$ABROAD" "$ENV")
 snap()   { local f; for f in "${STATE[@]}"; do cp -p "$f" "$f.prev"; done; rm -rf "$EXITS.prev"; cp -a "$EXITS" "$EXITS.prev"; }
 unsnap() { local f; for f in "${STATE[@]}"; do mv -f "$f.prev" "$f"; done; rm -rf "$EXITS"; mv "$EXITS.prev" "$EXITS"; }
 commit_files() { local f; for f in "${STATE[@]}"; do rm -f "$f.prev"; done; rm -rf "$EXITS.prev"; }
@@ -549,7 +556,7 @@ cmd_exit() {
     esac
 }
 
-# Сайт для списка «напрямую»: домен (с поддоменами), IP или подсеть, geosite:/geoip:/full:/keyword:.
+# Сайт для списков direct и abroad: домен (с поддоменами), IP или подсеть, geosite:/geoip:/full:/keyword:.
 norm_site() {
     local s; s=$(printf %s "$1" | tr 'A-Z' 'a-z' | sed 's#^[a-z]*://##; s#/.*##; s#:[0-9]*$##; s#^\*\.##')
     [[ "$1" =~ ^(geosite|geoip|domain|full|keyword|regexp): ]] && s=$1
@@ -559,34 +566,41 @@ norm_site() {
     echo "$s"
 }
 
-cmd_direct() {
+# Списки сайтов: direct — напрямую с российского IP, abroad — через выход, даже если сайт российский.
+cmd_sites() {
+    local kind=$1 file ex; shift
+    if [ "$kind" = direct ]; then file=$DIRECT ex=ozon.ru; else file=$ABROAD ex=bank.bitrix24.ru; fi
     case "${1:-}" in
         ""|list)
-            echo "Напрямую с этого сервера (с российского IP), мимо выходов:"
-            echo "  всегда: российские сайты (geosite:category-ru) и адреса (geoip:ru)"
-            if grep -q . "$DIRECT"; then sed 's/^/  /' "$DIRECT"; else echo "  своих сайтов нет. Добавить: vpn direct add ozon.ru"; fi
+            if [ "$kind" = direct ]; then
+                echo "Напрямую с этого сервера (с российского IP), мимо выходов:"
+                echo "  всегда: российские сайты (geosite:category-ru) и адреса (geoip:ru)"
+            else
+                echo "Через выход ключа (с заграничного IP), даже если сайт российский:"
+            fi
+            if grep -q . "$file"; then sed 's/^/  /' "$file"; else echo "  своих сайтов нет. Добавить: vpn $kind add $ex"; fi
             ;;
         add)
-            shift; [ $# -gt 0 ] || die "Укажи сайты: vpn direct add ozon.ru wb.ru"
+            shift; [ $# -gt 0 ] || die "Укажи сайты: vpn $kind add $ex"
             local s added=0
             snap
             for s in "$@"; do
                 s=$(norm_site "$s") || { unsnap; exit 1; }
-                grep -qxF "$s" "$DIRECT" || { echo "$s" >> "$DIRECT"; added=$((added + 1)); }
+                grep -qxF "$s" "$file" || { echo "$s" >> "$file"; added=$((added + 1)); }
             done
             [ "$added" -gt 0 ] || { unsnap; echo "Эти сайты уже в списке."; return; }
             commit
             echo "Добавлено: $added. Действует сразу для всех ключей."
             ;;
         del)
-            shift; [ $# -gt 0 ] || die "Укажи сайт: vpn direct del ozon.ru"
+            shift; [ $# -gt 0 ] || die "Укажи сайт: vpn $kind del $ex"
             snap
             local s
-            for s in "$@"; do s=$(norm_site "$s") || { unsnap; exit 1; }; grep -vxF "$s" "$DIRECT" > "$DIRECT.tmp" || true; mv "$DIRECT.tmp" "$DIRECT"; done
+            for s in "$@"; do s=$(norm_site "$s") || { unsnap; exit 1; }; grep -vxF "$s" "$file" > "$file.tmp" || true; mv "$file.tmp" "$file"; done
             commit
-            echo "Готово. Список: vpn direct"
+            echo "Готово. Список: vpn $kind"
             ;;
-        *) die "vpn direct [list] | add <сайт>... | del <сайт>..." ;;
+        *) die "vpn $kind [list] | add <сайт>... | del <сайт>..." ;;
     esac
 }
 
@@ -669,7 +683,7 @@ cmd_check() {
                 || { echo "✗ $SUB_DOMAIN указывает не на этот сервер ($(dns_a "$SUB_DOMAIN")) — поправь A-запись"; ok=0; }
         fi
     fi
-    echo "  ключей: $(clients | grep -c . || true), сайтов напрямую: $(grep -c . "$DIRECT" || true)"
+    echo "  ключей: $(clients | grep -c . || true), сайтов напрямую: $(grep -c . "$DIRECT" || true), через выход: $(grep -c . "$ABROAD" || true)"
     echo "  память: $(free -m | awk '/Mem/{print $3"/"$2" МБ"}'), диск: $(df -h / | awk 'NR==2{print $3"/"$2}'), работает: $(uptime -p)"
     [ "$ok" = 1 ] && echo "Всё в порядке." || { echo "Есть проблемы — смотри выше и journalctl -u xray -n 50."; return 1; }
 }
@@ -716,6 +730,7 @@ vpn — вход каскада $LABEL ($(server_ip)), маскировка по
   vpn route <имя> <выход>    сменить выход ключа (auto — любой живой, default — по умолчанию)
   vpn exit                   выходы; vpn exit add <имя> <ссылка> | del <имя> | default <имя>
   vpn direct                 сайты напрямую с российского IP; vpn direct add|del <сайт>...
+  vpn abroad                 российские сайты через выход (заграничный IP); vpn abroad add|del <сайт>...
   vpn sni [домен]            сайт, под который маскируется вход
   vpn check                  проверить вход, выходы и каскад целиком
   vpn restart                перезапустить xray
@@ -730,7 +745,8 @@ case "${1:-}" in
     list|ls|stats) cmd_list ;;
     route)   cmd_route "${2:-}" "${3:-}" ;;
     exit|exits) shift; cmd_exit "$@" ;;
-    direct)  shift; cmd_direct "$@" ;;
+    direct)  shift; cmd_sites direct "$@" ;;
+    abroad)  shift; cmd_sites abroad "$@" ;;
     sni)     cmd_sni "${2:-}" ;;
     sub)     shift; cmd_sub "$@" ;;
     check)   cmd_check ;;
